@@ -1,0 +1,17 @@
+{
+  "name": "rrfamily-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot pencatatan keuangan pribadi + keluarga (RRfamily)",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:migrate": "wrangler d1 migrations apply rrfamily-db"
+  },
+  "dependencies": {
+    "hono": "^4.0.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.0.0"
+  }
+}

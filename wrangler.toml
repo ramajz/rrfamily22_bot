@@ -1,0 +1,13 @@
+name = "rrfamily-bot"
+main = "src/index.js"
+compatibility_date = "2026-08-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "rrfamily-db"
+database_id = "c28e0a0a-b1a6-447a-8914-60f3b207d953"
+
+[vars]
+BOT_NAME = "RRfamily Bot"
+AI_ENDPOINT = "https://ai.databyte.co.id/v1"
+AI_MODEL = "deepseek-v4-flash"
