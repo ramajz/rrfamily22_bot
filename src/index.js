@@ -123,7 +123,7 @@ Aturan:
 - date: "kemarin" = tanggal kemarin. null = hari ini.
 - Jangan tambahkan teks lain, HANYA JSON.`;
 
-  const res = await fetch(env.AI_ENDPOINT + '/v1/chat/completions', {
+  const res = await fetch(env.AI_ENDPOINT + '/chat/completions', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
