@@ -26,6 +26,32 @@ async function sendMessage(env, chatId, text) {
   return res.json();
 }
 
+// Kirim pesan + tombol inline
+async function sendMessageKb(env, chatId, text, inlineKeyboard) {
+  const url = `https://api.telegram.org/bot${env.BOT_TOKEN}/sendMessage`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text,
+      parse_mode: 'HTML',
+      reply_markup: inlineKeyboard,
+    }),
+  });
+  return res.json();
+}
+
+// Jawab callback query (hilangkan loading di tombol)
+async function answerCallback(env, callbackId, text) {
+  const url = `https://api.telegram.org/bot${env.BOT_TOKEN}/answerCallbackQuery`;
+  await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ callback_query_id: callbackId, text }),
+  });
+}
+
 function isWhitelisted(userId) {
   return String(userId) in WHITELIST;
 }
@@ -211,6 +237,58 @@ async function aiRekap(env, month, summary) {
   return data.choices?.[0]?.message?.content || 'Gak bisa bikin analisis.';
 }
 
+// Handler klik tombol inline (callback query)
+async function handleCallback(env, cb) {
+  const chatId = cb.message.chat.id;
+  const userId = String(cb.from.id);
+  const data = cb.data || '';
+
+  if (!isWhitelisted(userId)) {
+    await answerCallback(env, cb.id, 'Bukan untuk kamu');
+    return;
+  }
+
+  // budget_scope_keluarga / budget_scope_pribadi → pilih kategori
+  if (data.startsWith('budget_scope_')) {
+    const scope = data.replace('budget_scope_', '');
+    const rows = await env.DB.prepare(
+      'SELECT name FROM categories WHERE scope = ? AND type = ? ORDER BY name'
+    ).bind(scope, 'expense').all();
+    const kb = {
+      inline_keyboard: [],
+    };
+    let row = [];
+    for (const r of rows.results || []) {
+      row.push({ text: r.name, callback_data: `budget_cat_${scope}_${r.name}` });
+      if (row.length === 2) {
+        kb.inline_keyboard.push(row);
+        row = [];
+      }
+    }
+    if (row.length) kb.inline_keyboard.push(row);
+    await answerCallback(env, cb.id, 'Pilih kategori');
+    return sendMessageKb(env, chatId,
+      `Pilih kategori (${scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi'}):`,
+      kb);
+  }
+
+  // budget_cat_<scope>_<nama> → minta nominal
+  if (data.startsWith('budget_cat_')) {
+    const rest = data.replace('budget_cat_', '');
+    const scope = rest.startsWith('keluarga_') ? 'keluarga' : 'pribadi';
+    const catName = rest.replace(/^(keluarga|pribadi)_/, '');
+    await env.DB.prepare(
+      'INSERT OR IGNORE INTO pending_input (telegram_id, action, scope, category) VALUES (?, ?, ?, ?)'
+    ).bind(userId, 'set_budget', scope, catName).run();
+    await answerCallback(env, cb.id, 'Ketik nominal');
+    return sendMessage(env, chatId,
+      `💰 Budget untuk <b>${catName}</b> (${scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi'}) berapa?\n` +
+      `Ketik nominal, contoh: <code>1jt</code> atau <code>500rb</code>`);
+  }
+
+  await answerCallback(env, cb.id, 'OK');
+}
+
 async function handleMessage(env, msg) {
   const chatId = msg.chat.id;
   const userId = String(msg.from.id);
@@ -221,6 +299,28 @@ async function handleMessage(env, msg) {
   }
 
   const name = WHITELIST[userId];
+
+  // ==== Cek pending input (flow budget interaktif) ====
+  const pending = await env.DB.prepare('SELECT * FROM pending_input WHERE telegram_id = ?')
+    .bind(userId).first();
+  if (pending) {
+    const amount = parseAmount(text);
+    if (!amount) {
+      return sendMessage(env, chatId, 'Itu bukan angka yang valid 🤔 Ketik nominal aja, contoh: <code>1jt</code>');
+    }
+    if (pending.action === 'set_budget') {
+      const scope = pending.scope || 'keluarga';
+      const catName = pending.category || 'Lainnya';
+      await env.DB.prepare(
+        'INSERT OR IGNORE INTO categories (scope, name, type) VALUES (?, ?, ?)'
+      ).bind(scope, catName, 'expense').run();
+      await env.DB.prepare('UPDATE categories SET budget = ? WHERE scope = ? AND name = ?')
+        .bind(amount, scope, catName).run();
+    }
+    await env.DB.prepare('DELETE FROM pending_input WHERE telegram_id = ?').bind(userId).run();
+    return sendMessage(env, chatId,
+      `✅ Budget ${pending.scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi'} · ${pending.category} = ${rupiah(amount)}`);
+  }
 
   // ==== Commands ====
   if (text === '/start' || text === '/help') {
@@ -324,31 +424,36 @@ async function handleMessage(env, msg) {
     );
   }
 
-  // ==== Budget per kategori ====
-  // /budget → lihat semua budget
-  // /budget keluarga makan 1jt → set budget
-  // /budget prib jajan 500rb → set budget
+  // ==== Budget per kategori (flow interaktif) ====
+  // /budget → tombol pilih scope → tombol pilih kategori → ketik nominal
   if (text === '/budget' || text.startsWith('/budget ')) {
     if (text.trim() === '/budget') {
+      // Tampilkan budget sekarang + tombol set/hapus
       let out = '📋 <b>Budget per Kategori</b>\n\n';
       for (const sc of ['keluarga', 'pribadi']) {
         const rows = await env.DB.prepare(
-          'SELECT name, budget FROM categories WHERE scope = ? AND budget IS NOT NULL ORDER BY name'
+          'SELECT name, budget FROM categories WHERE scope = ? ORDER BY name'
         ).bind(sc).all();
         out += `<b>${sc === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi'}</b>\n`;
         if (!rows.results?.length) {
-          out += 'Belum ada budget diset\n';
+          out += 'Belum ada kategori\n';
         } else {
           for (const r of rows.results) {
-            out += `• ${r.name}: ${rupiah(r.budget)}\n`;
+            out += r.budget ? `• ${r.name}: ${rupiah(r.budget)}\n` : `• ${r.name}: -\n`;
           }
         }
         out += '\n';
       }
-      out += 'Set: <code>/budget keluarga makan 1jt</code>\nHapus: <code>/budget hapus keluarga makan</code>';
-      return sendMessage(env, chatId, out.trim());
+      out += 'Pilih tombol di bawah buat set budget 👇';
+      const kb = {
+        inline_keyboard: [
+          [{ text: '🏠 Set Budget Keluarga', callback_data: 'budget_scope_keluarga' }],
+          [{ text: '🙋 Set Budget Pribadi', callback_data: 'budget_scope_pribadi' }],
+        ],
+      };
+      return sendMessageKb(env, chatId, out.trim(), kb);
     }
-
+    // Text form: /budget hapus keluarga makan
     const parts = text.replace('/budget', '').trim().split(/\s+/);
     if (parts[0] === 'hapus') {
       const scope = parts[1] === 'prib' || parts[1] === 'pribadi' ? 'pribadi' : 'keluarga';
@@ -357,12 +462,12 @@ async function handleMessage(env, msg) {
         .bind(scope, catName).run();
       return sendMessage(env, chatId, `🗑️ Budget "${catName}" (${scope}) dihapus`);
     }
+    // Legacy text form masih didukung: /budget keluarga makan 1jt
     const scope = parts[0] === 'prib' || parts[0] === 'pribadi' ? 'pribadi' : 'keluarga';
     const amountStr = parts[parts.length - 1];
     const catName = parts.slice(1, -1).join(' ') || 'Lainnya';
     const amount = parseAmount(amountStr);
-    if (!amount) return sendMessage(env, chatId, 'Format: /budget keluarga makan 1jt');
-    // pastikan kategori ada (tambahkan kalau belum)
+    if (!amount) return sendMessage(env, chatId, 'Ketik: /budget hapus keluarga makan — atau pakai tombol');
     await env.DB.prepare(
       'INSERT OR IGNORE INTO categories (scope, name, type) VALUES (?, ?, ?)'
     ).bind(scope, catName, 'expense').run();
@@ -508,6 +613,9 @@ app.post('/webhook', async c => {
 
   if (update.message) {
     await handleMessage(env, update.message);
+  }
+  if (update.callback_query) {
+    await handleCallback(env, update.callback_query);
   }
   return c.json({ ok: true });
 });
