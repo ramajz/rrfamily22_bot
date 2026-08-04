@@ -73,7 +73,7 @@ function parseAmount(str) {
   return Math.round(num);
 }
 
-// Parse tanggal relatif: "kemarin", "2/8", "2026-08-02", default hari ini
+// Parse tanggal relatif: "kemarin", "2 hari lalu", "3/8", "2026-08-02", default hari ini
 function parseDate(str) {
   if (!str) return todayStr();
   const s = String(str).trim().toLowerCase();
@@ -82,7 +82,13 @@ function parseDate(str) {
     d.setDate(d.getDate() - 1);
     return d.toISOString().slice(0, 10);
   }
-  let m = s.match(/^(\d{1,2})\/(\d{1,2})$/); // dd/mm
+  let m = s.match(/(\d+)\s*hari\s*(yang\s*)?lalu/); // "2 hari lalu", "3 hari yang lalu"
+  if (m) {
+    const d = new Date();
+    d.setDate(d.getDate() - parseInt(m[1], 10));
+    return d.toISOString().slice(0, 10);
+  }
+  m = s.match(/^(\d{1,2})\/(\d{1,2})$/); // dd/mm
   if (m) {
     const year = new Date().getFullYear();
     return `${year}-${String(m[2]).padStart(2, '0')}-${String(m[1]).padStart(2, '0')}`;
@@ -120,7 +126,7 @@ Aturan:
 - scope: null jika tidak jelas (default "${defaultScope}").
 - "gaji", "masuk", "terima" = income. Sisanya expense.
 - category: cocokkan ke konteks. "makan"=Makan, "kopi"=Jajan, "bensin"=Transport, "cicilan"=Cicilan.
-- date: "kemarin" = tanggal kemarin. null = hari ini.
+- date: "kemarin" = tanggal kemarin, "2 hari lalu" = 2 hari yang lalu. null = hari ini.
 - Jangan tambahkan teks lain, HANYA JSON.`;
 
   const res = await fetch(env.AI_ENDPOINT + '/chat/completions', {
