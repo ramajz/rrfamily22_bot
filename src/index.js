@@ -153,6 +153,58 @@ Aturan:
   }
 }
 
+// ============ AI Parse STRUK (foto/gambar via MiniMax-M3) ============
+async function aiParseStruk(env, imageBase64, defaultScope) {
+  const system = `Kamu adalah parser struk belanja. Lihat gambar struk, ekstrak transaksinya, jawab HANYA JSON:
+{
+  "type": "income|expense",
+  "amount": <int rupiah, nilai TOTAL belanja>,
+  "category": "<kategori: Makan|Transport|Kebutuhan|Cicilan|Pendidikan|Kesehatan|Hiburan|Lainnya>",
+  "date": "YYYY-MM-DD|null"
+}
+Aturan:
+- amount = total yang dibayar (angka paling besar di bagian bawah struk, biasanya TOTAL).
+- Jika struk minimarket/supermarket/restoran/makanan = kategori Makan (atau Kebutuhan untuk belanja bulanan seperti sembako). Gunakan penilaianmu.
+- Jika bukan struk (misal transfer/QRIS), tetap ekstrak nominal terbesarnya.
+- date: null jika tidak tertera jelas.
+- Jangan tambahkan teks lain, HANYA JSON.`;
+
+  const res = await fetch(env.AI_ENDPOINT + '/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${env.AI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: env.AI_VISION_MODEL || 'MiniMax-M3',
+      messages: [
+        { role: 'system', content: system },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'Baca struk ini.' },
+            { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${imageBase64}` } },
+          ],
+        },
+      ],
+      temperature: 0,
+      max_tokens: 200,
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error('AI struk error: ' + err.slice(0, 200));
+  }
+  const data = await res.json();
+  const content = data.choices?.[0]?.message?.content || '{}';
+  try {
+    return JSON.parse(content.replace(/```json|```/g, '').trim());
+  } catch {
+    return null;
+  }
+}
+
 // ============ Command Handlers ============
 async function handleCatat(env, userId, scope, type, amount, category, date, note) {
   await env.DB.prepare(
@@ -300,7 +352,56 @@ async function handleMessage(env, msg) {
 
   const name = WHITELIST[userId];
 
-  // ==== Cek pending input (flow budget interaktif) ====
+  // ==== Handler FOTO STRUK ====
+  if (msg.photo && msg.photo.length > 0) {
+    const photo = msg.photo[msg.photo.length - 1]; // resolusi tertinggi
+    await sendMessage(env, chatId, '🧾 Baca struk...');
+    try {
+      // 1. Ambil file dari Telegram
+      const fileRes = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/getFile?file_id=${photo.file_id}`);
+      const fileData = await fileRes.json();
+      const filePath = fileData?.result?.file_path;
+      if (!filePath) throw new Error('getFile gagal: ' + JSON.stringify(fileData));
+
+      // 2. Download file
+      const dl = await fetch(`https://api.telegram.org/file/bot${env.BOT_TOKEN}/${filePath}`);
+      if (!dl.ok) throw new Error('Download file gagal: ' + dl.status);
+      const buf = await dl.arrayBuffer();
+      const base64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
+      if (base64.length > 2_000_000) {
+        return sendMessage(env, chatId, 'Foto kegedean, kirim yang lebih kecil ya 😅');
+      }
+
+      // 3. AI parse struk (MiniMax-M3 vision)
+      const userRow = await env.DB.prepare('SELECT scope FROM users WHERE telegram_id = ?').bind(userId).first();
+      const defaultScope = userRow?.scope || 'keluarga';
+      const parsed = await aiParseStruk(env, base64, defaultScope);
+      if (!parsed || !parsed.amount) {
+        return sendMessage(env, chatId, 'Gagal baca struknya 😅 Coba foto yang lebih jelas, atau ketik manual: <code>makan 25rb</code>');
+      }
+
+      const scope = parsed.scope || defaultScope;
+      const type = parsed.type || 'expense';
+      const category = matchCategory(parsed.category, scope) || 'Lainnya';
+      const date = parsed.date || todayStr();
+
+      // 4. Konfirmasi dulu sebelum simpan
+      await env.DB.prepare(
+        'INSERT OR REPLACE INTO pending_input (telegram_id, action, scope, category, data) VALUES (?, ?, ?, ?, ?)'
+      ).bind(userId, 'confirm_struk', scope, category, JSON.stringify({ type, amount: parsed.amount, date })).run();
+
+      const icon = type === 'income' ? '⬆️' : '⬇️';
+      return sendMessage(env, chatId,
+        `📸 Aku baca struknya:\n` +
+        `${scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi'} · ${icon} ${category} · <b>${rupiah(parsed.amount)}</b>\n\n` +
+        `Ketik <b>ok</b> buat simpan, atau ketik koreksi (misal: <code>prib jajan</code>)`);
+    } catch (err) {
+      console.error('Foto error:', err);
+      return sendMessage(env, chatId, '⚠️ Gagal proses foto. Coba lagi atau ketik manual.');
+    }
+  }
+
+  // ==== Cek pending input (flow budget interaktif + konfirmasi struk) ====
   const pending = await env.DB.prepare('SELECT * FROM pending_input WHERE telegram_id = ?')
     .bind(userId).first();
   if (pending) {
@@ -316,10 +417,33 @@ async function handleMessage(env, msg) {
       ).bind(scope, catName, 'expense').run();
       await env.DB.prepare('UPDATE categories SET budget = ? WHERE scope = ? AND name = ?')
         .bind(amount, scope, catName).run();
+      await env.DB.prepare('DELETE FROM pending_input WHERE telegram_id = ?').bind(userId).run();
+      return sendMessage(env, chatId,
+        `✅ Budget ${pending.scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi'} · ${pending.category} = ${rupiah(amount)}`);
     }
-    await env.DB.prepare('DELETE FROM pending_input WHERE telegram_id = ?').bind(userId).run();
-    return sendMessage(env, chatId,
-      `✅ Budget ${pending.scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi'} · ${pending.category} = ${rupiah(amount)}`);
+
+    if (pending.action === 'confirm_struk') {
+      const low = text.toLowerCase();
+      if (low === 'ok' || low === 'y' || low === 'iya' || low === 'bener' || low === 'benar' || low === 'simpan') {
+        const d = JSON.parse(pending.data || '{}');
+        await handleCatat(env, userId, pending.scope, d.type, d.amount, pending.category, 'struk', d.date || todayStr());
+        await env.DB.prepare('DELETE FROM pending_input WHERE telegram_id = ?').bind(userId).run();
+        const icon = d.type === 'income' ? '⬆️' : '⬇️';
+        let reply = `✅ Dicatat!\n${pending.scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi'} · ${icon} ${pending.category} · <b>${rupiah(d.amount)}</b>`;
+        if (d.type === 'expense') {
+          const alert = await checkBudgetAlert(env, pending.scope, d.amount);
+          if (alert) reply += '\n\n' + alert;
+        }
+        return sendMessage(env, chatId, reply);
+      }
+      if (low === 'batal' || low === 'cancel' || low === 'ga jadi' || low === 'gajadi') {
+        await env.DB.prepare('DELETE FROM pending_input WHERE telegram_id = ?').bind(userId).run();
+        return sendMessage(env, chatId, '🗑️ Dibatalin, gak disimpan.');
+      }
+      // Selain ok/batal = ketik manual baru (parse teks biasa)
+      await env.DB.prepare('DELETE FROM pending_input WHERE telegram_id = ?').bind(userId).run();
+      // lanjut ke flow parse teks di bawah (jangan return)
+    }
   }
 
   // ==== Commands ====
