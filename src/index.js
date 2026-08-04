@@ -111,7 +111,71 @@ function matchCategory(word, scope) {
   return found || null;
 }
 
-// ============ AI Parse (DataByte) ============
+// ============ AI Parse (DataByte, fallback CommandCode) ============
+async function callAI(env, { system, user, model, visionBase64 }) {
+  const primary = {
+    endpoint: env.AI_ENDPOINT,
+    key: env.AI_API_KEY,
+    model,
+  };
+  const fallback = {
+    endpoint: env.CC_ENDPOINT,
+    key: env.CC_API_KEY,
+    model: model.includes('MiniMax') ? env.CC_VISION_MODEL : env.CC_MODEL,
+  };
+
+  // content bisa string (teks) atau array (vision)
+  const content = visionBase64
+    ? [
+        { type: 'text', text: user },
+        { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${visionBase64}` } },
+      ]
+    : user;
+
+  let lastErr = null;
+  for (const p of [primary, fallback]) {
+    if (!p.endpoint || !p.key || !p.model) continue;
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 25000); // timeout 25 detik
+      const res = await fetch(p.endpoint + '/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${p.key}`,
+        },
+        body: JSON.stringify({
+          model: p.model,
+          messages: [
+            { role: 'system', content: system },
+            { role: 'user', content },
+          ],
+          temperature: 0,
+          max_tokens: 200,
+        }),
+        signal: ctrl.signal,
+      });
+      clearTimeout(timer);
+      if (!res.ok) {
+        const err = await res.text();
+        lastErr = new Error(`AI error (${p.endpoint}): ${err.slice(0, 150)}`);
+        continue;
+      }
+      const data = await res.json();
+      const contentOut = data.choices?.[0]?.message?.content || '{}';
+      try {
+        const parsed = JSON.parse(contentOut.replace(/```json|```/g, '').trim());
+        return { parsed, provider: p.endpoint };
+      } catch {
+        lastErr = new Error(`JSON parse gagal dari ${p.endpoint}: ${contentOut.slice(0, 100)}`);
+      }
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr || new Error('Semua provider AI gagal');
+}
+
 async function aiParse(env, text, defaultScope) {
   const system = `Kamu adalah parser transaksi keuangan. Ekstrak dari teks user (bahasa Indonesia) dan jawab HANYA JSON:
 {
@@ -129,37 +193,15 @@ Aturan:
 - date: "kemarin" = tanggal kemarin, "2 hari lalu" = 2 hari yang lalu. null = hari ini.
 - Jangan tambahkan teks lain, HANYA JSON.`;
 
-  const res = await fetch(env.AI_ENDPOINT + '/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${env.AI_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: env.AI_MODEL || 'deepseek-v4-flash',
-      messages: [
-        { role: 'system', content: system },
-        { role: 'user', content: text },
-      ],
-      temperature: 0,
-      max_tokens: 200,
-    }),
+  const { parsed } = await callAI(env, {
+    system,
+    user: text,
+    model: env.AI_MODEL || 'deepseek-v4-flash',
   });
-
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error('AI error: ' + err.slice(0, 200));
-  }
-  const data = await res.json();
-  const content = data.choices?.[0]?.message?.content || '{}';
-  try {
-    return JSON.parse(content.replace(/```json|```/g, '').trim());
-  } catch {
-    return null;
-  }
+  return parsed;
 }
 
-// ============ AI Parse STRUK (foto/gambar via MiniMax-M3) ============
+// ============ AI Parse STRUK (foto/gambar via MiniMax-M3, fallback mimo) ============
 async function aiParseStruk(env, imageBase64, defaultScope) {
   const system = `Kamu adalah parser struk belanja. Lihat gambar struk, ekstrak transaksinya, jawab HANYA JSON:
 {
@@ -175,47 +217,20 @@ Aturan:
 - date: null jika tidak tertera jelas.
 - Jangan tambahkan teks lain, HANYA JSON.`;
 
-  const res = await fetch(env.AI_ENDPOINT + '/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${env.AI_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: env.AI_VISION_MODEL || 'MiniMax-M3',
-      messages: [
-        { role: 'system', content: system },
-        {
-          role: 'user',
-          content: [
-            { type: 'text', text: 'Baca struk ini.' },
-            { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${imageBase64}` } },
-          ],
-        },
-      ],
-      temperature: 0,
-      max_tokens: 200,
-    }),
+  const { parsed } = await callAI(env, {
+    system,
+    user: 'Baca struk ini.',
+    model: env.AI_VISION_MODEL || 'MiniMax-M3',
+    visionBase64: imageBase64,
   });
-
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error('AI struk error: ' + err.slice(0, 200));
-  }
-  const data = await res.json();
-  const content = data.choices?.[0]?.message?.content || '{}';
-  try {
-    return JSON.parse(content.replace(/```json|```/g, '').trim());
-  } catch {
-    return null;
-  }
+  return parsed;
 }
 
 // ============ Command Handlers ============
-async function handleCatat(env, userId, scope, type, amount, category, date, note) {
+async function handleCatat(env, userId, scope, type, amount, category, note, date) {
   await env.DB.prepare(
     'INSERT INTO transactions (user_id, scope, type, amount, category, note, tx_date) VALUES (?, ?, ?, ?, ?, ?, ?)'
-  ).bind(userId, scope, type, amount, category, note || null, date).run();
+  ).bind(userId, scope, type, amount, category, note || null, date || todayStr()).run();
 }
 
 async function getSisa(env, scope) {
@@ -468,8 +483,8 @@ async function handleMessage(env, msg) {
       `/analisis — analisis naratif AI\n` +
       `/budget — lihat budget (set: /budget keluarga 6.8jt)\n` +
       `/riwayat — transaksi terakhir\n` +
-      `/hapus #id — hapus transaksi\n` +
-      `/edit #id 30000 — edit transaksi\n` +
+      `/hapus #12 — hapus transaksi (ID dari /riwayat)\n` +
+      `/edit #12 30000 — edit transaksi\n` +
       `/kategori — daftar kategori\n` +
       `/kategori tambah "nama"\n` +
       `/saldo — saldo total\n` +
@@ -618,15 +633,23 @@ async function handleMessage(env, msg) {
     return sendMessage(env, chatId, out.trim());
   }
 
-  if (text.startsWith('/hapus ')) {
-    const id = parseInt(text.replace(/[^0-9]/g, ''));
-    if (!id) return sendMessage(env, chatId, 'Format: /hapus #123 (lihat ID di /riwayat)');
+  // ==== /hapus — format ketat: hanya angka, gak boleh nyangkut kata ====
+  if (text === '/hapus' || text.startsWith('/hapus ')) {
+    const arg = text.replace('/hapus', '').trim().replace(/^#/, ''); // buang # kalau ada
+    // Hanya izinkan angka (dan optional #). Kalau ada huruf/kata → tolak.
+    if (!arg || !/^\d+$/.test(arg)) {
+      return sendMessage(env, chatId,
+        `⚠️ Format salah. Hapus pakai ID dari /riwayat:\n\n` +
+        `<code>/hapus #12</code> atau <code>/hapus 12</code>\n\n` +
+        `ID transaksi: 12 (bukan kata/keterangan).`);
+    }
+    const id = parseInt(arg, 10);
     const res = await env.DB.prepare('DELETE FROM transactions WHERE id = ? AND user_id = ?')
       .bind(id, userId).run();
     if (res.meta.changes > 0) {
       return sendMessage(env, chatId, `🗑️ Transaksi #${id} dihapus`);
     }
-    return sendMessage(env, chatId, `❌ Transaksi #${id} gak ditemukan (atau bukan punyamu)`);
+    return sendMessage(env, chatId, `❌ Transaksi #${id} gak ditemukan (atau bukan punyamu). Cek /riwayat buat ID yang bener.`);
   }
 
   if (text.startsWith('/edit ')) {
@@ -679,6 +702,16 @@ async function handleMessage(env, msg) {
   }
 
   // ==== Free-text parse (AI) ====
+  // Guard: teks diawali "/" tapi bukan command dikenal → jangan masuk AI parse
+  // (mencegah "hapus makan 25rb" salah dicatat sebagai transaksi)
+  const KNOWN_CMDS = ['/start', '/help', '/sisa', '/rekap', '/analisis', '/budget', '/riwayat',
+    '/hapus', '/edit', '/kategori', '/saldo', '/setprib', '/setkel'];
+  if (text.startsWith('/') && !KNOWN_CMDS.some(c => text === c || text.startsWith(c + ' '))) {
+    return sendMessage(env, chatId,
+      `❓ Command <code>${text.split(' ')[0]}</code> gak dikenal.\n` +
+      `Ketik /help buat lihat semua perintah.`);
+  }
+
   try {
     const userRow = await env.DB.prepare('SELECT scope FROM users WHERE telegram_id = ?').bind(userId).first();
     const defaultScope = userRow?.scope || 'keluarga';
