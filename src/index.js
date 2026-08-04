@@ -159,6 +159,58 @@ async function getRekap(env, scope, days) {
   return res.results || [];
 }
 
+// Cek budget kategori bulan ini, return pesan alert kalau melewati 80%/100%
+async function checkBudgetAlert(env, scope, category, amount) {
+  const month = todayStr().slice(0, 7);
+  const cat = await env.DB.prepare('SELECT budget FROM categories WHERE scope = ? AND name = ?')
+    .bind(scope, category).first();
+  if (!cat?.budget) return null;
+
+  const spent = await env.DB.prepare(
+    `SELECT COALESCE(SUM(amount),0) AS total FROM transactions
+     WHERE scope = ? AND category = ? AND type = 'expense' AND tx_date LIKE ?`
+  ).bind(scope, category, month + '%').first();
+
+  const total = (spent?.total || 0) + amount;
+  const budget = cat.budget;
+  const pct = (total / budget) * 100;
+
+  if (pct >= 100) {
+    return `⚠️ <b>OVER BUDGET!</b> ${scope === 'keluarga' ? '🏠' : '🙋'} ${category}: ${rupiah(total)} dari ${rupiah(budget)} (${pct.toFixed(0)}%)`;
+  }
+  if (pct >= 80) {
+    return `🟡 ${scope === 'keluarga' ? '🏠' : '🙋'} ${category}: sudah ${rupiah(total)} dari ${rupiah(budget)} (${pct.toFixed(0)}%) — hampir habis!`;
+  }
+  return null;
+}
+
+// AI rekap naratif bulanan
+async function aiRekap(env, month, summary) {
+  const system = `Kamu adalah analis keuangan keluarga. Berikut ringkasan transaksi bulan ${month}. Buat analisis singkat (maks 200 kata) dalam bahasa Indonesia santai tapi informatif: pola pengeluaran, kategori paling besar, saran hemat yang actionable. Jangan sebutkan "berdasarkan data" berulang-ulang.`;
+  const res = await fetch(env.AI_ENDPOINT + '/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${env.AI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: env.AI_MODEL || 'deepseek-v4-flash',
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: summary },
+      ],
+      temperature: 0.7,
+      max_tokens: 400,
+    }),
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error('AI rekap error: ' + err.slice(0, 200));
+  }
+  const data = await res.json();
+  return data.choices?.[0]?.message?.content || 'Gak bisa bikin analisis.';
+}
+
 async function handleMessage(env, msg) {
   const chatId = msg.chat.id;
   const userId = String(msg.from.id);
@@ -183,6 +235,11 @@ async function handleMessage(env, msg) {
       `/sisa — sisa budget bulan ini\n` +
       `/rekap — rekap bulan ini\n` +
       `/rekap 7 — rekap 7 hari\n` +
+      `/analisis — analisis naratif AI\n` +
+      `/budget — lihat/set budget kategori\n` +
+      `/riwayat — transaksi terakhir\n` +
+      `/hapus #id — hapus transaksi\n` +
+      `/edit #id 30000 — edit transaksi\n` +
       `/kategori — daftar kategori\n` +
       `/kategori tambah "nama"\n` +
       `/saldo — saldo total\n` +
@@ -201,6 +258,26 @@ async function handleMessage(env, msg) {
         `Sisa: <b>${rupiah(s.sisa)}</b>\n\n`;
     }
     return sendMessage(env, chatId, out.trim());
+  }
+
+  // /analisis → rekap naratif AI bulan ini (per scope)
+  if (text === '/analisis') {
+    const month = todayStr().slice(0, 7);
+    let summary = '';
+    for (const sc of ['keluarga', 'pribadi']) {
+      const rows = await env.DB.prepare(
+        `SELECT category, type, COALESCE(SUM(amount),0) AS total FROM transactions
+         WHERE scope = ? AND tx_date LIKE ? GROUP BY category, type ORDER BY total DESC`
+      ).bind(sc, month + '%').all();
+      const s = await getSisa(env, sc);
+      summary += `\n[${sc === 'keluarga' ? 'Keluarga' : 'Pribadi'}]\n` +
+        `Income: ${s.income}, Expense: ${s.expense}, Sisa: ${s.sisa}\n`;
+      for (const r of rows.results || []) {
+        summary += `- ${r.category} (${r.type}): ${r.amount}\n`;
+      }
+    }
+    const aiText = await aiRekap(env, month, summary);
+    return sendMessage(env, chatId, aiText);
   }
 
   if (text.startsWith('/rekap')) {
@@ -247,6 +324,53 @@ async function handleMessage(env, msg) {
     );
   }
 
+  // ==== Budget per kategori ====
+  // /budget → lihat semua budget
+  // /budget keluarga makan 1jt → set budget
+  // /budget prib jajan 500rb → set budget
+  if (text === '/budget' || text.startsWith('/budget ')) {
+    if (text.trim() === '/budget') {
+      let out = '📋 <b>Budget per Kategori</b>\n\n';
+      for (const sc of ['keluarga', 'pribadi']) {
+        const rows = await env.DB.prepare(
+          'SELECT name, budget FROM categories WHERE scope = ? AND budget IS NOT NULL ORDER BY name'
+        ).bind(sc).all();
+        out += `<b>${sc === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi'}</b>\n`;
+        if (!rows.results?.length) {
+          out += 'Belum ada budget diset\n';
+        } else {
+          for (const r of rows.results) {
+            out += `• ${r.name}: ${rupiah(r.budget)}\n`;
+          }
+        }
+        out += '\n';
+      }
+      out += 'Set: <code>/budget keluarga makan 1jt</code>\nHapus: <code>/budget hapus keluarga makan</code>';
+      return sendMessage(env, chatId, out.trim());
+    }
+
+    const parts = text.replace('/budget', '').trim().split(/\s+/);
+    if (parts[0] === 'hapus') {
+      const scope = parts[1] === 'prib' || parts[1] === 'pribadi' ? 'pribadi' : 'keluarga';
+      const catName = parts.slice(2).join(' ');
+      await env.DB.prepare('UPDATE categories SET budget = NULL WHERE scope = ? AND name = ?')
+        .bind(scope, catName).run();
+      return sendMessage(env, chatId, `🗑️ Budget "${catName}" (${scope}) dihapus`);
+    }
+    const scope = parts[0] === 'prib' || parts[0] === 'pribadi' ? 'pribadi' : 'keluarga';
+    const amountStr = parts[parts.length - 1];
+    const catName = parts.slice(1, -1).join(' ') || 'Lainnya';
+    const amount = parseAmount(amountStr);
+    if (!amount) return sendMessage(env, chatId, 'Format: /budget keluarga makan 1jt');
+    // pastikan kategori ada (tambahkan kalau belum)
+    await env.DB.prepare(
+      'INSERT OR IGNORE INTO categories (scope, name, type) VALUES (?, ?, ?)'
+    ).bind(scope, catName, 'expense').run();
+    await env.DB.prepare('UPDATE categories SET budget = ? WHERE scope = ? AND name = ?')
+      .bind(amount, scope, catName).run();
+    return sendMessage(env, chatId, `✅ Budget ${scope} · ${catName} = ${rupiah(amount)}`);
+  }
+
   if (text === '/kategori') {
     let out = '';
     for (const sc of ['keluarga', 'pribadi']) {
@@ -254,6 +378,64 @@ async function handleMessage(env, msg) {
         DEFAULT_CATEGORIES[sc].join(', ') + '\n';
     }
     return sendMessage(env, chatId, out.trim());
+  }
+
+  // ==== Riwayat + edit + hapus ====
+  // /riwayat [n] → transaksi terakhir (default 10)
+  // /hapus <id> → hapus transaksi
+  // /edit <id> kategori baru | /edit <id> 50000 | /edit <id> makan 30000
+  if (text === '/riwayat' || text.startsWith('/riwayat ')) {
+    const n = parseInt(text.split(' ')[1]) || 10;
+    const rows = await env.DB.prepare(
+      'SELECT id, scope, type, amount, category, tx_date, note FROM transactions WHERE user_id = ? ORDER BY tx_date DESC, id DESC LIMIT ?'
+    ).bind(userId, Math.min(n, 20)).all();
+    if (!rows.results?.length) return sendMessage(env, chatId, 'Belum ada transaksi.');
+    let out = `📒 <b>Riwayat (${rows.results.length})</b>\n`;
+    for (const r of rows.results) {
+      const icon = r.type === 'income' ? '⬆️' : '⬇️';
+      const sc = r.scope === 'keluarga' ? '🏠' : '🙋';
+      out += `<code>#${r.id}</code> ${sc} ${icon} ${r.category}: ${rupiah(r.amount)} · ${r.tx_date}\n`;
+    }
+    out += '\nHapus: <code>/hapus #id</code>\nEdit: <code>/edit #id 30000</code>';
+    return sendMessage(env, chatId, out.trim());
+  }
+
+  if (text.startsWith('/hapus ')) {
+    const id = parseInt(text.replace(/[^0-9]/g, ''));
+    if (!id) return sendMessage(env, chatId, 'Format: /hapus #123 (lihat ID di /riwayat)');
+    const res = await env.DB.prepare('DELETE FROM transactions WHERE id = ? AND user_id = ?')
+      .bind(id, userId).run();
+    if (res.meta.changes > 0) {
+      return sendMessage(env, chatId, `🗑️ Transaksi #${id} dihapus`);
+    }
+    return sendMessage(env, chatId, `❌ Transaksi #${id} gak ditemukan (atau bukan punyamu)`);
+  }
+
+  if (text.startsWith('/edit ')) {
+    const parts = text.replace('/edit', '').trim().split(/\s+/);
+    const id = parseInt(parts[0].replace(/[^0-9]/g, ''));
+    if (!id || parts.length < 2) {
+      return sendMessage(env, chatId, 'Format: /edit #123 30000 atau /edit #123 makan 30000');
+    }
+    // cek punya user
+    const existing = await env.DB.prepare('SELECT * FROM transactions WHERE id = ? AND user_id = ?')
+      .bind(id, userId).first();
+    if (!existing) return sendMessage(env, chatId, `❌ Transaksi #${id} gak ditemukan (atau bukan punyamu)`);
+
+    const rest = parts.slice(1).join(' ');
+    const amountMatch = rest.match(/(\d+(?:[.,]\d+)?\s*(?:rb|k|jt|j|ribu|juta)?)$/i);
+    const amount = amountMatch ? parseAmount(amountMatch[1]) : null;
+    const catPart = amountMatch ? rest.slice(0, rest.length - amountMatch[0].length).trim() : rest;
+
+    if (amount) {
+      await env.DB.prepare('UPDATE transactions SET amount = ? WHERE id = ?').bind(amount, id).run();
+    }
+    if (catPart) {
+      const scope = existing.scope;
+      const cat = matchCategory(catPart, scope) || catPart;
+      await env.DB.prepare('UPDATE transactions SET category = ? WHERE id = ?').bind(cat, id).run();
+    }
+    return sendMessage(env, chatId, `✅ Transaksi #${id} diupdate`);
   }
 
   if (text.startsWith('/kategori tambah')) {
@@ -296,11 +478,16 @@ async function handleMessage(env, msg) {
     await handleCatat(env, userId, scope, type, parsed.amount, category, text, date);
 
     const icon = type === 'income' ? '⬆️' : '⬇️';
-    return sendMessage(env, chatId,
-      `✅ Dicatat ${name}!\n` +
+    let reply = `✅ Dicatat ${name}!\n` +
       `${scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi'} · ${icon} ${category} · <b>${rupiah(parsed.amount)}</b>\n` +
-      `<code>${date}</code> · ketik /sisa buat cek budget`
-    );
+      `<code>${date}</code> · ketik /sisa buat cek budget`;
+
+    // Alert budget kalau expense
+    if (type === 'expense') {
+      const alert = await checkBudgetAlert(env, scope, category, parsed.amount);
+      if (alert) reply += '\n\n' + alert;
+    }
+    return sendMessage(env, chatId, reply);
   } catch (err) {
     console.error('AI parse error:', err);
     return sendMessage(env, chatId, '⚠️ Error parsing. Coba lagi atau /help');
