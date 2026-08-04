@@ -171,7 +171,8 @@ async function getSisa(env, scope) {
     if (r.type === 'income') income = r.total;
     else expense = r.total;
   }
-  return { income, expense, sisa: income - expense };
+  const b = await env.DB.prepare('SELECT amount FROM budgets WHERE scope = ?').bind(scope).first();
+  return { income, expense, sisa: income - expense, budget: b?.amount || null };
 }
 
 async function getRekap(env, scope, days) {
@@ -185,27 +186,26 @@ async function getRekap(env, scope, days) {
   return res.results || [];
 }
 
-// Cek budget kategori bulan ini, return pesan alert kalau melewati 80%/100%
-async function checkBudgetAlert(env, scope, category, amount) {
+// Cek budget dompet bulan ini, return pesan alert kalau melewati 80%/100%
+async function checkBudgetAlert(env, scope, amount) {
   const month = todayStr().slice(0, 7);
-  const cat = await env.DB.prepare('SELECT budget FROM categories WHERE scope = ? AND name = ?')
-    .bind(scope, category).first();
-  if (!cat?.budget) return null;
+  const b = await env.DB.prepare('SELECT amount FROM budgets WHERE scope = ?').bind(scope).first();
+  if (!b?.amount) return null;
 
   const spent = await env.DB.prepare(
     `SELECT COALESCE(SUM(amount),0) AS total FROM transactions
-     WHERE scope = ? AND category = ? AND type = 'expense' AND tx_date LIKE ?`
-  ).bind(scope, category, month + '%').first();
+     WHERE scope = ? AND type = 'expense' AND tx_date LIKE ?`
+  ).bind(scope, month + '%').first();
 
   const total = (spent?.total || 0) + amount;
-  const budget = cat.budget;
+  const budget = b.amount;
   const pct = (total / budget) * 100;
 
   if (pct >= 100) {
-    return `⚠️ <b>OVER BUDGET!</b> ${scope === 'keluarga' ? '🏠' : '🙋'} ${category}: ${rupiah(total)} dari ${rupiah(budget)} (${pct.toFixed(0)}%)`;
+    return `⚠️ <b>OVER BUDGET!</b> ${scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi'}: ${rupiah(total)} dari ${rupiah(budget)} (${pct.toFixed(0)}%)`;
   }
   if (pct >= 80) {
-    return `🟡 ${scope === 'keluarga' ? '🏠' : '🙋'} ${category}: sudah ${rupiah(total)} dari ${rupiah(budget)} (${pct.toFixed(0)}%) — hampir habis!`;
+    return `🟡 ${scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi'}: sudah ${rupiah(total)} dari ${rupiah(budget)} (${pct.toFixed(0)}%) — hampir habis!`;
   }
   return null;
 }
@@ -336,7 +336,7 @@ async function handleMessage(env, msg) {
       `/rekap — rekap bulan ini\n` +
       `/rekap 7 — rekap 7 hari\n` +
       `/analisis — analisis naratif AI\n` +
-      `/budget — lihat/set budget kategori\n` +
+      `/budget — lihat budget (set: /budget keluarga 6.8jt)\n` +
       `/riwayat — transaksi terakhir\n` +
       `/hapus #id — hapus transaksi\n` +
       `/edit #id 30000 — edit transaksi\n` +
@@ -352,10 +352,18 @@ async function handleMessage(env, msg) {
     let out = '';
     for (const sc of ['keluarga', 'pribadi']) {
       const s = await getSisa(env, sc);
-      out += `<b>${sc === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi'}</b>\n` +
-        `Income: ${rupiah(s.income)}\n` +
-        `Expense: ${rupiah(s.expense)}\n` +
-        `Sisa: <b>${rupiah(s.sisa)}</b>\n\n`;
+      const label = sc === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi';
+      out += `<b>${label}</b>\n`;
+      if (s.budget) {
+        const pct = (s.expense / s.budget) * 100;
+        const sisaBudget = s.budget - s.expense;
+        const status = sisaBudget < 0 ? '⚠️' : (pct >= 80 ? '🟡' : '✅');
+        out += `Budget: ${rupiah(s.budget)}\n` +
+          `Expense: ${rupiah(s.expense)} (${pct.toFixed(0)}%)\n` +
+          `Sisa budget: <b>${status} ${rupiah(sisaBudget)}</b>\n\n`;
+      } else {
+        out += `Income: ${rupiah(s.income)}\nExpense: ${rupiah(s.expense)}\nSisa: <b>${rupiah(s.sisa)}</b>\n\n`;
+      }
     }
     return sendMessage(env, chatId, out.trim());
   }
@@ -424,56 +432,31 @@ async function handleMessage(env, msg) {
     );
   }
 
-  // ==== Budget per kategori (flow interaktif) ====
-  // /budget → tombol pilih scope → tombol pilih kategori → ketik nominal
+  // ==== Budget per DOMWET (2 angka, simple) ====
+  // /budget → lihat | /budget keluarga 6.8jt | /budget pribadi 1.5jt | /budget hapus keluarga
   if (text === '/budget' || text.startsWith('/budget ')) {
-    if (text.trim() === '/budget') {
-      // Tampilkan budget sekarang + tombol set/hapus
-      let out = '📋 <b>Budget per Kategori</b>\n\n';
-      for (const sc of ['keluarga', 'pribadi']) {
-        const rows = await env.DB.prepare(
-          'SELECT name, budget FROM categories WHERE scope = ? ORDER BY name'
-        ).bind(sc).all();
-        out += `<b>${sc === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi'}</b>\n`;
-        if (!rows.results?.length) {
-          out += 'Belum ada kategori\n';
-        } else {
-          for (const r of rows.results) {
-            out += r.budget ? `• ${r.name}: ${rupiah(r.budget)}\n` : `• ${r.name}: -\n`;
-          }
-        }
-        out += '\n';
-      }
-      out += 'Pilih tombol di bawah buat set budget 👇';
-      const kb = {
-        inline_keyboard: [
-          [{ text: '🏠 Set Budget Keluarga', callback_data: 'budget_scope_keluarga' }],
-          [{ text: '🙋 Set Budget Pribadi', callback_data: 'budget_scope_pribadi' }],
-        ],
-      };
-      return sendMessageKb(env, chatId, out.trim(), kb);
-    }
-    // Text form: /budget hapus keluarga makan
     const parts = text.replace('/budget', '').trim().split(/\s+/);
+    if (parts.length === 0 || parts[0] === '') {
+      let out = '📋 <b>Budget Bulanan</b>\n';
+      for (const sc of ['keluarga', 'pribadi']) {
+        const b = await env.DB.prepare('SELECT amount FROM budgets WHERE scope = ?').bind(sc).first();
+        out += `${sc === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi'}: ${b?.amount ? rupiah(b.amount) : '<i>belum diset</i>'}\n`;
+      }
+      out += '\nSet: <code>/budget keluarga 6.8jt</code>\nHapus: <code>/budget hapus keluarga</code>';
+      return sendMessage(env, chatId, out.trim());
+    }
     if (parts[0] === 'hapus') {
       const scope = parts[1] === 'prib' || parts[1] === 'pribadi' ? 'pribadi' : 'keluarga';
-      const catName = parts.slice(2).join(' ');
-      await env.DB.prepare('UPDATE categories SET budget = NULL WHERE scope = ? AND name = ?')
-        .bind(scope, catName).run();
-      return sendMessage(env, chatId, `🗑️ Budget "${catName}" (${scope}) dihapus`);
+      await env.DB.prepare('DELETE FROM budgets WHERE scope = ?').bind(scope).run();
+      return sendMessage(env, chatId, `🗑️ Budget ${scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi'} dihapus`);
     }
-    // Legacy text form masih didukung: /budget keluarga makan 1jt
     const scope = parts[0] === 'prib' || parts[0] === 'pribadi' ? 'pribadi' : 'keluarga';
-    const amountStr = parts[parts.length - 1];
-    const catName = parts.slice(1, -1).join(' ') || 'Lainnya';
-    const amount = parseAmount(amountStr);
-    if (!amount) return sendMessage(env, chatId, 'Ketik: /budget hapus keluarga makan — atau pakai tombol');
+    const amount = parseAmount(parts[1]);
+    if (!amount) return sendMessage(env, chatId, 'Format: /budget keluarga 6.8jt atau /budget pribadi 1.5jt');
     await env.DB.prepare(
-      'INSERT OR IGNORE INTO categories (scope, name, type) VALUES (?, ?, ?)'
-    ).bind(scope, catName, 'expense').run();
-    await env.DB.prepare('UPDATE categories SET budget = ? WHERE scope = ? AND name = ?')
-      .bind(amount, scope, catName).run();
-    return sendMessage(env, chatId, `✅ Budget ${scope} · ${catName} = ${rupiah(amount)}`);
+      'INSERT INTO budgets (scope, amount) VALUES (?, ?) ON CONFLICT(scope) DO UPDATE SET amount = excluded.amount'
+    ).bind(scope, amount).run();
+    return sendMessage(env, chatId, `✅ Budget ${scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi'} = ${rupiah(amount)}`);
   }
 
   if (text === '/kategori') {
@@ -589,7 +572,7 @@ async function handleMessage(env, msg) {
 
     // Alert budget kalau expense
     if (type === 'expense') {
-      const alert = await checkBudgetAlert(env, scope, category, parsed.amount);
+      const alert = await checkBudgetAlert(env, scope, parsed.amount);
       if (alert) reply += '\n\n' + alert;
     }
     return sendMessage(env, chatId, reply);
