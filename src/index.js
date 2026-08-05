@@ -455,23 +455,7 @@ async function handleMessage(env, msg) {
   const pending = await env.DB.prepare('SELECT * FROM pending_input WHERE telegram_id = ?')
     .bind(userId).first();
   if (pending) {
-    const amount = parseAmount(text);
-    if (!amount) {
-      return sendMessage(env, chatId, 'Itu bukan angka yang valid 🤔 Ketik nominal aja, contoh: <code>1jt</code>');
-    }
-    if (pending.action === 'set_budget') {
-      const scope = pending.scope || 'keluarga';
-      const catName = pending.category || 'Lainnya';
-      await env.DB.prepare(
-        'INSERT OR IGNORE INTO categories (scope, name, type) VALUES (?, ?, ?)'
-      ).bind(scope, catName, 'expense').run();
-      await env.DB.prepare('UPDATE categories SET budget = ? WHERE scope = ? AND name = ?')
-        .bind(amount, scope, catName).run();
-      await env.DB.prepare('DELETE FROM pending_input WHERE telegram_id = ?').bind(userId).run();
-      return sendMessage(env, chatId,
-        `✅ Budget ${pending.scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi'} · ${pending.category} = ${rupiah(amount)}`);
-    }
-
+    // confirm_struk: tangani ok/batal DULU (teks bebas, bukan angka)
     if (pending.action === 'confirm_struk') {
       const low = text.toLowerCase();
       if (low === 'ok' || low === 'y' || low === 'iya' || low === 'bener' || low === 'benar' || low === 'simpan') {
@@ -512,8 +496,27 @@ async function handleMessage(env, msg) {
       }
       // Selain ok/batal = ketik manual baru (parse teks biasa)
       await env.DB.prepare('DELETE FROM pending_input WHERE telegram_id = ?').bind(userId).run();
-      // lanjut ke flow parse teks di bawah (jangan return)
+      text = low; // lanjut ke free-text parse di bawah
     }
+
+    const amount = parseAmount(text);
+    if (!amount) {
+      return sendMessage(env, chatId, 'Itu bukan angka yang valid 🤔 Ketik nominal aja, contoh: <code>1jt</code>');
+    }
+    if (pending.action === 'set_budget') {
+      const scope = pending.scope || 'keluarga';
+      const catName = pending.category || 'Lainnya';
+      await env.DB.prepare(
+        'INSERT OR IGNORE INTO categories (scope, name, type) VALUES (?, ?, ?)'
+      ).bind(scope, catName, 'expense').run();
+      await env.DB.prepare('UPDATE categories SET budget = ? WHERE scope = ? AND name = ?')
+        .bind(amount, scope, catName).run();
+      await env.DB.prepare('DELETE FROM pending_input WHERE telegram_id = ?').bind(userId).run();
+      return sendMessage(env, chatId,
+        `✅ Budget ${pending.scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi'} · ${pending.category} = ${rupiah(amount)}`);
+    }
+
+    return sendMessage(env, chatId, '⚠️ Ada pending input yang belum selesai. Ketik <b>batal</b> atau tunggu sebentar.');
   }
 
   // ==== Commands ====
