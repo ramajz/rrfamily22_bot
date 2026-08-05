@@ -183,6 +183,7 @@ async function aiParse(env, text, defaultScope) {
   "type": "income|expense",
   "amount": <int rupiah>,
   "category": "<nama kategori>",
+  "item": "<nama produk/merk, atau null>",
   "date": "YYYY-MM-DD|null"
 }
 Aturan:
@@ -190,6 +191,7 @@ Aturan:
 - scope: null jika tidak jelas (default "${defaultScope}").
 - "gaji", "masuk", "terima" = income. Sisanya expense.
 - category: cocokkan ke konteks. "makan"=Makan, "kopi"=Jajan, "bensin"=Transport, "cicilan"=Cicilan.
+- item: NAMA PRODUK/MERK jika disebut. Contoh: "pampers sweety 55rb" → item="pampers sweety", "pertalite revo 30rb" → item="pertalite". "makan 25rb" → null. "gaji masuk" → null. Penting: tangkap kata kunci produk & merk.
 - date: "kemarin" = tanggal kemarin, "2 hari lalu" = 2 hari yang lalu. null = hari ini.
 - Jangan tambahkan teks lain, HANYA JSON.`;
 
@@ -208,11 +210,13 @@ async function aiParseStruk(env, imageBase64, defaultScope) {
   "type": "income|expense",
   "amount": <int rupiah, nilai TOTAL belanja>,
   "category": "<kategori: Makan|Transport|Kebutuhan|Cicilan|Pendidikan|Kesehatan|Hiburan|Lainnya>",
+  "item": "<nama produk/merk utama yang dibeli, atau null>",
   "date": "YYYY-MM-DD|null"
 }
 Aturan:
 - amount = total yang dibayar (angka paling besar di bagian bawah struk, biasanya TOTAL).
 - Jika struk minimarket/supermarket/restoran/makanan = kategori Makan (atau Kebutuhan untuk belanja bulanan seperti sembako). Gunakan penilaianmu.
+- item: produk/merk yang paling menonjol dari struk. Contoh struk diapers → item="pampers". Struk bensin → item="pertalite". Struk makanan campuran → item=null.
 - Jika bukan struk (misal transfer/QRIS), tetap ekstrak nominal terbesarnya.
 - date: null jika tidak tertera jelas.
 - Jangan tambahkan teks lain, HANYA JSON.`;
@@ -227,10 +231,10 @@ Aturan:
 }
 
 // ============ Command Handlers ============
-async function handleCatat(env, userId, scope, type, amount, category, note, date) {
+async function handleCatat(env, userId, scope, type, amount, category, note, date, item) {
   await env.DB.prepare(
-    'INSERT INTO transactions (user_id, scope, type, amount, category, note, tx_date) VALUES (?, ?, ?, ?, ?, ?, ?)'
-  ).bind(userId, scope, type, amount, category, note || null, date || todayStr()).run();
+    'INSERT INTO transactions (user_id, scope, type, amount, category, note, tx_date, item) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+  ).bind(userId, scope, type, amount, category, note || null, date || todayStr(), item || null).run();
 }
 
 async function getSisa(env, scope) {
@@ -447,7 +451,7 @@ async function handleMessage(env, msg) {
       const low = text.toLowerCase();
       if (low === 'ok' || low === 'y' || low === 'iya' || low === 'bener' || low === 'benar' || low === 'simpan') {
         const d = JSON.parse(pending.data || '{}');
-        await handleCatat(env, userId, pending.scope, d.type, d.amount, pending.category, 'struk', d.date || todayStr());
+        await handleCatat(env, userId, pending.scope, d.type, d.amount, pending.category, 'struk', d.date || todayStr(), d.item || null);
         await env.DB.prepare('DELETE FROM pending_input WHERE telegram_id = ?').bind(userId).run();
         const icon = d.type === 'income' ? '⬆️' : '⬇️';
         let reply = `✅ Dicatat!\n${pending.scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi'} · ${icon} ${pending.category} · <b>${rupiah(d.amount)}</b>`;
@@ -485,6 +489,7 @@ async function handleMessage(env, msg) {
       `/riwayat — transaksi terakhir\n` +
       `/hapus #12 — hapus transaksi (ID dari /riwayat)\n` +
       `/edit #12 30000 — edit transaksi\n` +
+      `/harga pampers — riwayat harga item (deteksi kenaikan)\n` +
       `/kategori — daftar kategori\n` +
       `/kategori tambah "nama"\n` +
       `/saldo — saldo total\n` +
@@ -679,6 +684,51 @@ async function handleMessage(env, msg) {
     return sendMessage(env, chatId, `✅ Transaksi #${id} diupdate`);
   }
 
+  // ==== /harga <item> — riwayat harga + deteksi kenaikan ====
+  if (text === '/harga' || text.startsWith('/harga ')) {
+    const q = text.replace('/harga', '').trim().toLowerCase();
+    if (!q) {
+      return sendMessage(env, chatId,
+        `Format: <code>/harga pampers</code>\n\n` +
+        `Cari riwayat harga item dari catatanmu. Contoh: /harga pertalite, /harga sweety`);
+    }
+    const rows = await env.DB.prepare(
+      `SELECT id, scope, amount, category, note, item, tx_date FROM transactions
+       WHERE user_id = ? AND (LOWER(item) LIKE ? OR LOWER(note) LIKE ?)
+       ORDER BY tx_date ASC, id ASC LIMIT 50`
+    ).bind(userId, `%${q}%`, `%${q}%`).all();
+    if (!rows.results?.length) {
+      return sendMessage(env, chatId,
+        `Gak ada riwayat "<b>${q}</b>" di catatanmu.\n` +
+        `Coba kata lain, atau mulai catat dengan nama item, contoh: <code>pampers sweety 55rb</code>`);
+    }
+    // Kelompokkan per item unik (utamakan kolom item, fallback note)
+    const byItem = {};
+    for (const r of rows.results) {
+      const key = (r.item || r.note || '').toLowerCase();
+      if (!byItem[key]) byItem[key] = [];
+      byItem[key].push(r);
+    }
+    let out = `📈 <b>Riwayat "${q}" (${rows.results.length} catatan)</b>\n`;
+    for (const [key, list] of Object.entries(byItem)) {
+      const prices = list.map(r => r.amount);
+      const min = Math.min(...prices), max = Math.max(...prices);
+      const first = list[0], last = list[list.length - 1];
+      const delta = last.amount - first.amount;
+      const pct = first.amount > 0 ? (delta / first.amount) * 100 : 0;
+      const trend = delta > 0 ? `📈 naik ${rupiah(delta)} (${pct.toFixed(0)}%)` :
+        delta < 0 ? `📉 turun ${rupiah(Math.abs(delta))}` : '➡️ stabil';
+      const label = key.charAt(0).toUpperCase() + key.slice(1);
+      out += `\n<b>${label}</b> · ${list.length}x · ${rupiah(min)}–${rupiah(max)}\n`;
+      for (const r of list.slice(-5)) {
+        const sc = r.scope === 'keluarga' ? '🏠' : '🙋';
+        out += `  ${sc} ${rupiah(r.amount)} · ${r.tx_date}\n`;
+      }
+      if (list.length >= 2) out += `  ${trend}\n`;
+    }
+    return sendMessage(env, chatId, out.trim());
+  }
+
   if (text.startsWith('/kategori tambah')) {
     const m = text.match(/"([^"]+)"/);
     const catName = m ? m[1] : text.replace('/kategori tambah', '').trim();
@@ -705,7 +755,7 @@ async function handleMessage(env, msg) {
   // Guard: teks diawali "/" tapi bukan command dikenal → jangan masuk AI parse
   // (mencegah "hapus makan 25rb" salah dicatat sebagai transaksi)
   const KNOWN_CMDS = ['/start', '/help', '/sisa', '/rekap', '/analisis', '/budget', '/riwayat',
-    '/hapus', '/edit', '/kategori', '/saldo', '/setprib', '/setkel'];
+    '/hapus', '/edit', '/kategori', '/saldo', '/setprib', '/setkel', '/harga'];
   if (text.startsWith('/') && !KNOWN_CMDS.some(c => text === c || text.startsWith(c + ' '))) {
     return sendMessage(env, chatId,
       `❓ Command <code>${text.split(' ')[0]}</code> gak dikenal.\n` +
@@ -726,7 +776,7 @@ async function handleMessage(env, msg) {
     const category = matchCategory(parsed.category, scope) || 'Lainnya';
     const date = parsed.date || todayStr();
 
-    await handleCatat(env, userId, scope, type, parsed.amount, category, text, date);
+    await handleCatat(env, userId, scope, type, parsed.amount, category, text, date, parsed.item || null);
 
     const icon = type === 'income' ? '⬆️' : '⬇️';
     let reply = `✅ Dicatat ${name}!\n` +
