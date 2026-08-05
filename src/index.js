@@ -205,19 +205,25 @@ Aturan:
 
 // ============ AI Parse STRUK (foto/gambar via MiniMax-M3, fallback mimo) ============
 async function aiParseStruk(env, imageBase64, defaultScope) {
-  const system = `Kamu adalah parser struk belanja. Lihat gambar struk, ekstrak transaksinya, jawab HANYA JSON:
+  const system = `Kamu adalah parser struk belanja. Lihat gambar struk, ekstrak SEMUA item, jawab HANYA JSON:
 {
   "type": "income|expense",
-  "amount": <int rupiah, nilai TOTAL belanja>,
+  "amount": <int rupiah, TOTAL belanja>,
   "category": "<kategori: Makan|Transport|Kebutuhan|Cicilan|Pendidikan|Kesehatan|Hiburan|Lainnya>",
-  "item": "<nama produk/merk utama yang dibeli, atau null>",
-  "date": "YYYY-MM-DD|null"
+  "date": "YYYY-MM-DD|null",
+  "items": [
+    {"name": "<nama produk/merk>", "amount": <int rupiah>},
+    {"name": "...", "amount": <int>}
+  ]
 }
 Aturan:
 - amount = total yang dibayar (angka paling besar di bagian bawah struk, biasanya TOTAL).
-- Jika struk minimarket/supermarket/restoran/makanan = kategori Makan (atau Kebutuhan untuk belanja bulanan seperti sembako). Gunakan penilaianmu.
-- item: produk/merk yang paling menonjol dari struk. Contoh struk diapers → item="pampers". Struk bensin → item="pertalite". Struk makanan campuran → item=null.
-- Jika bukan struk (misal transfer/QRIS), tetap ekstrak nominal terbesarnya.
+- items: BREAKDOWN SEMUA produk yang dibeli dengan harga masing-masing. PENTING: jangan gabung, satu produk = satu entry. Contoh "SUSU DANCOW 25.000, ROTI TAWAR 15.000, SABUN 12.000" → items=[{"name":"susu dancow","amount":25000},{"name":"roti tawar","amount":15000},{"name":"sabun","amount":12000}].
+- Jika struk punya banyak item, masukkan semuanya. Harga satuan × qty = amount item.
+- Jika total di struk TIDAK SAMA dengan jumlah items (misal ada diskon/pajak), amount tetap total asli struk; items tetap rincian produk.
+- Jika bukan struk belanja (misal transfer/QRIS, struk bensin 1 item), items cukup 1 entry.
+- Jika gambar bukan struk sama sekali, items=[] dan amount=0.
+- category: Makan untuk restoran/minimarket makanan, Kebutuhan untuk belanja bulanan/sembako.
 - date: null jika tidak tertera jelas.
 - Jangan tambahkan teks lain, HANYA JSON.`;
 
@@ -411,15 +417,34 @@ async function handleMessage(env, msg) {
       const date = parsed.date || todayStr();
 
       // 4. Konfirmasi dulu sebelum simpan
+      // Normalisasi items: filter amount valid, min Rp5rb, max 8 item, urut terbesar
+      let items = Array.isArray(parsed.items) ? parsed.items : [];
+      items = items
+        .filter(i => i && typeof i.amount === 'number' && i.amount > 0)
+        .map(i => ({ name: String(i.name || 'item').trim().toLowerCase() || 'item', amount: Math.round(i.amount) }))
+        .filter(i => i.amount >= 5000)
+        .sort((a, b) => b.amount - a.amount)
+        .slice(0, 8);
+
       await env.DB.prepare(
         'INSERT OR REPLACE INTO pending_input (telegram_id, action, scope, category, data) VALUES (?, ?, ?, ?, ?)'
-      ).bind(userId, 'confirm_struk', scope, category, JSON.stringify({ type, amount: parsed.amount, date })).run();
+      ).bind(userId, 'confirm_struk', scope, category, JSON.stringify({ type, amount: parsed.amount, date, items })).run();
 
       const icon = type === 'income' ? '⬆️' : '⬇️';
-      return sendMessage(env, chatId,
-        `📸 Aku baca struknya:\n` +
-        `${scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi'} · ${icon} ${category} · <b>${rupiah(parsed.amount)}</b>\n\n` +
-        `Ketik <b>ok</b> buat simpan, atau ketik koreksi (misal: <code>prib jajan</code>)`);
+      let msg = `📸 Aku baca struknya:\n` +
+        `${scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi'} · ${icon} ${category} · <b>${rupiah(parsed.amount)}</b>`;
+
+      // Tampilkan breakdown item kalau ada (dan expense)
+      if (items.length > 1 && type === 'expense') {
+        msg += `\n\n🛒 <b>Item (${items.length}):</b>`;
+        for (const it of items) {
+          msg += `\n  • ${it.name.charAt(0).toUpperCase() + it.name.slice(1)} — ${rupiah(it.amount)}`;
+        }
+        msg += `\n\n<i>Ketik <b>ok</b> buat simpan semua item, atau <b>batal</b>.</i>`;
+      } else {
+        msg += `\n\nKetik <b>ok</b> buat simpan, atau ketik koreksi (misal: <code>prib jajan</code>)`;
+      }
+      return sendMessage(env, chatId, msg);
     } catch (err) {
       console.error('Foto error:', err);
       return sendMessage(env, chatId, '⚠️ Gagal proses foto. Coba lagi atau ketik manual.');
@@ -451,6 +476,26 @@ async function handleMessage(env, msg) {
       const low = text.toLowerCase();
       if (low === 'ok' || low === 'y' || low === 'iya' || low === 'bener' || low === 'benar' || low === 'simpan') {
         const d = JSON.parse(pending.data || '{}');
+        // Simpan semua item sebagai transaksi terpisah kalau ada breakdown
+        if (d.items && d.items.length > 1 && d.type === 'expense') {
+          const sum = d.items.reduce((s, i) => s + (i.amount || 0), 0);
+          const diff = (d.amount || 0) - sum; // selisih total vs items (diskon/pajak/item <5rb)
+          const saved = [];
+          for (const it of d.items) {
+            await handleCatat(env, userId, pending.scope, 'expense', it.amount, pending.category, `struk: ${it.name}`, d.date || todayStr(), it.name);
+            saved.push(it.name);
+          }
+          if (diff > 0) {
+            await handleCatat(env, userId, pending.scope, 'expense', diff, pending.category, 'struk: lainnya', d.date || todayStr(), 'lainnya');
+            saved.push('lainnya');
+          }
+          await env.DB.prepare('DELETE FROM pending_input WHERE telegram_id = ?').bind(userId).run();
+          let reply = `✅ Dicatat ${saved.length} item dari struk!\n${pending.scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi'} · <b>${rupiah(d.amount)}</b> total`;
+          const alert = await checkBudgetAlert(env, pending.scope, d.amount);
+          if (alert) reply += '\n\n' + alert;
+          return sendMessage(env, chatId, reply);
+        }
+        // Tanpa breakdown → simpan 1 transaksi (perilaku lama)
         await handleCatat(env, userId, pending.scope, d.type, d.amount, pending.category, 'struk', d.date || todayStr(), d.item || null);
         await env.DB.prepare('DELETE FROM pending_input WHERE telegram_id = ?').bind(userId).run();
         const icon = d.type === 'income' ? '⬆️' : '⬇️';
