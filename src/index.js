@@ -26,6 +26,17 @@ async function sendMessage(env, chatId, text) {
   return res.json();
 }
 
+// Edit pesan yang sudah ada (pakai message_id dari callback) + tombol inline
+async function editMessageKb(env, chatId, messageId, text, inlineKeyboard) {
+  const url = `https://api.telegram.org/bot${env.BOT_TOKEN}/editMessageText`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chatId, message_id: messageId, text, parse_mode: 'HTML', reply_markup: inlineKeyboard }),
+  });
+  return res.json();
+}
+
 // Kirim pesan + tombol inline
 async function sendMessageKb(env, chatId, text, inlineKeyboard) {
   const url = `https://api.telegram.org/bot${env.BOT_TOKEN}/sendMessage`;
@@ -41,6 +52,7 @@ async function sendMessageKb(env, chatId, text, inlineKeyboard) {
   });
   return res.json();
 }
+
 
 // Jawab callback query (hilangkan loading di tombol)
 async function answerCallback(env, callbackId, text) {
@@ -369,13 +381,41 @@ async function handleCallback(env, cb) {
       `Ketik nominal, contoh: <code>1jt</code> atau <code>500rb</code>`);
   }
 
+  // riwayat_prev_<page> / riwayat_next_<page> → ganti pesan riwayat
+  if (data.startsWith('riwayat_prev_') || data.startsWith('riwayat_next_')) {
+    const cur = parseInt(data.split('_').pop()) || 1;
+    const page = data.startsWith('riwayat_prev_') ? Math.max(1, cur - 1) : cur + 1;
+    const PER_PAGE = 10;
+    const offset = (page - 1) * PER_PAGE;
+    const totalRow = await env.DB.prepare('SELECT COUNT(*) AS c FROM transactions WHERE user_id = ?').bind(userId).first();
+    const total = totalRow?.c || 0;
+    const maxPage = Math.max(1, Math.ceil(total / PER_PAGE));
+    const rows = await env.DB.prepare(
+      'SELECT id, scope, type, amount, category, tx_date, note FROM transactions WHERE user_id = ? ORDER BY tx_date DESC, id DESC LIMIT ? OFFSET ?'
+    ).bind(userId, PER_PAGE, offset).all();
+    let out = `📒 <b>Riwayat (hal ${page}/${maxPage}, total ${total})</b>\n`;
+    for (const r of rows.results || []) {
+      const icon = r.type === 'income' ? '⬆️' : '⬇️';
+      const sc = r.scope === 'keluarga' ? '🏠' : '🙋';
+      out += `<code>#${r.id}</code> ${sc} ${icon} ${r.category}: ${rupiah(r.amount)} · ${r.tx_date}\n`;
+    }
+    out += `\nHapus: <code>/hapus #id</code>\nEdit: <code>/edit #id 30000</code>`;
+    const kb = { inline_keyboard: [] };
+    const nav = [];
+    if (page > 1) nav.push({ text: '⬅️ Seb', callback_data: `riwayat_prev_${page}` });
+    if (page < maxPage) nav.push({ text: 'Berikut ➡️', callback_data: `riwayat_next_${page}` });
+    if (nav.length) kb.inline_keyboard.push(nav);
+    await editMessageKb(env, chatId, cb.message.message_id, out.trim(), kb);
+    return answerCallback(env, cb.id, `Hal ${page}/${maxPage}`);
+  }
+
   await answerCallback(env, cb.id, 'OK');
 }
 
 async function handleMessage(env, msg) {
   const chatId = msg.chat.id;
   const userId = String(msg.from.id);
-  const text = (msg.text || '').trim();
+  let text = (msg.text || '').trim();
 
   if (!isWhitelisted(userId)) {
     return sendMessage(env, chatId, 'Maaf, bot ini khusus keluarga 😊');
@@ -499,6 +539,62 @@ async function handleMessage(env, msg) {
       text = low; // lanjut ke free-text parse di bawah
     }
 
+    // confirm_hapus: tangani ya/batal
+    if (pending.action === 'confirm_hapus') {
+      const low = text.toLowerCase();
+      const d = JSON.parse(pending.data || '{}');
+      const id = d.id;
+      if (low === 'ya' || low === 'y' || low === 'iya' || low === 'hapus' || low === 'yakin') {
+        const res = await env.DB.prepare('DELETE FROM transactions WHERE id = ? AND user_id = ?')
+          .bind(id, userId).run();
+        await env.DB.prepare('DELETE FROM pending_input WHERE telegram_id = ?').bind(userId).run();
+        if (res.meta.changes > 0) {
+          return sendMessage(env, chatId, `🗑️ Transaksi #${id} dihapus.`);
+        }
+        return sendMessage(env, chatId, `❌ Transaksi #${id} gak ditemukan (atau sudah terhapus).`);
+      }
+      if (low === 'batal' || low === 'cancel' || low === 'ga jadi' || low === 'gajadi') {
+        await env.DB.prepare('DELETE FROM pending_input WHERE telegram_id = ?').bind(userId).run();
+        return sendMessage(env, chatId, '🗑️ Dibatalin, transaksi gak dihapus.');
+      }
+      // Selain ya/batal → batalkan konfirmasi
+      await env.DB.prepare('DELETE FROM pending_input WHERE telegram_id = ?').bind(userId).run();
+      return sendMessage(env, chatId, '⚠️ Penghapusan dibatalkan. Ketik <b>batal</b> kalau mau membatalkan.');
+    }
+
+    // confirm_edit: user balas perubahan (nominal / kategori / keduanya)
+    if (pending.action === 'confirm_edit') {
+      const low = text.toLowerCase();
+      if (low === 'batal' || low === 'cancel' || low === 'ga jadi' || low === 'gajadi') {
+        await env.DB.prepare('DELETE FROM pending_input WHERE telegram_id = ?').bind(userId).run();
+        return sendMessage(env, chatId, '✏️ Edit dibatalkan.');
+      }
+      const d = JSON.parse(pending.data || '{}');
+      const id = d.id;
+      const existing = await env.DB.prepare('SELECT * FROM transactions WHERE id = ? AND user_id = ?')
+        .bind(id, userId).first();
+      if (!existing) {
+        await env.DB.prepare('DELETE FROM pending_input WHERE telegram_id = ?').bind(userId).run();
+        return sendMessage(env, chatId, `❌ Transaksi #${id} gak ditemukan.`);
+      }
+      const amountMatch = text.match(/(\d+(?:[.,]\d+)?\s*(?:rb|k|jt|j|ribu|juta)?)$/i);
+      const amount = amountMatch ? parseAmount(amountMatch[1]) : null;
+      const catPart = amountMatch ? text.slice(0, text.length - amountMatch[0].length).trim() : text.trim();
+      if (amount) {
+        await env.DB.prepare('UPDATE transactions SET amount = ? WHERE id = ?').bind(amount, id).run();
+      }
+      if (catPart) {
+        const cat = matchCategory(catPart, existing.scope) || catPart;
+        await env.DB.prepare('UPDATE transactions SET category = ? WHERE id = ?').bind(cat, id).run();
+      }
+      if (!amount && !catPart) {
+        await env.DB.prepare('DELETE FROM pending_input WHERE telegram_id = ?').bind(userId).run();
+        return sendMessage(env, chatId, '⚠️ Gak ada perubahan. Ketik nominal/kategori, atau <b>batal</b>.');
+      }
+      await env.DB.prepare('DELETE FROM pending_input WHERE telegram_id = ?').bind(userId).run();
+      return sendMessage(env, chatId, `✅ Transaksi #${id} diupdate`);
+    }
+
     const amount = parseAmount(text);
     if (!amount) {
       return sendMessage(env, chatId, 'Itu bukan angka yang valid 🤔 Ketik nominal aja, contoh: <code>1jt</code>');
@@ -534,9 +630,9 @@ async function handleMessage(env, msg) {
       `/rekap 7 — rekap 7 hari\n` +
       `/analisis — analisis naratif AI\n` +
       `/budget — lihat budget (set: /budget keluarga 6.8jt)\n` +
-      `/riwayat — transaksi terakhir\n` +
-      `/hapus #12 — hapus transaksi (ID dari /riwayat)\n` +
-      `/edit #12 30000 — edit transaksi\n` +
+      `/riwayat — transaksi (pakai tombol ➡️ utk halaman berikutnya)\n` +
+      `/hapus #12 — hapus transaksi (ID dari /riwayat, ada konfirmasi)\n` +
+      `/edit #12 — lihat rincian lalu edit (atau /edit #12 30000)\n` +
       `/harga pampers — riwayat harga item (deteksi kenaikan)\n` +
       `/kategori — daftar kategori\n` +
       `/kategori tambah "nama"\n` +
@@ -667,26 +763,52 @@ async function handleMessage(env, msg) {
   }
 
   // ==== Riwayat + edit + hapus ====
-  // /riwayat [n] → transaksi terakhir (default 10)
-  // /hapus <id> → hapus transaksi
-  // /edit <id> kategori baru | /edit <id> 50000 | /edit <id> makan 30000
-  if (text === '/riwayat' || text.startsWith('/riwayat ')) {
-    const n = parseInt(text.split(' ')[1]) || 10;
+  // /riwayat → halaman 1 (terbaru)
+  // /riwayat <n> → halaman n (pagination)
+  // /riwayat_prev <n> / /riwayat_next <n> → navigasi via inline keyboard
+  const PER_PAGE = 10;
+  const isRiwayat = text === '/riwayat' || text.startsWith('/riwayat ') ||
+                    text.startsWith('/riwayat_prev ') || text.startsWith('/riwayat_next ');
+  if (isRiwayat) {
+    let page = 1;
+    if (text.startsWith('/riwayat ')) page = parseInt(text.split(' ')[1]) || 1;
+    else if (text.startsWith('/riwayat_prev ')) page = Math.max(1, (parseInt(text.split(' ')[1]) || 2) - 1);
+    else if (text.startsWith('/riwayat_next ')) page = parseInt(text.split(' ')[1]) + 1;
+    page = Math.max(1, page);
+    const offset = (page - 1) * PER_PAGE;
+
+    // Total count buat tahu halaman maksimum
+    const totalRow = await env.DB.prepare(
+      'SELECT COUNT(*) AS c FROM transactions WHERE user_id = ?'
+    ).bind(userId).first();
+    const total = totalRow?.c || 0;
+    const maxPage = Math.max(1, Math.ceil(total / PER_PAGE));
+
     const rows = await env.DB.prepare(
-      'SELECT id, scope, type, amount, category, tx_date, note FROM transactions WHERE user_id = ? ORDER BY tx_date DESC, id DESC LIMIT ?'
-    ).bind(userId, Math.min(n, 20)).all();
+      'SELECT id, scope, type, amount, category, tx_date, note FROM transactions WHERE user_id = ? ORDER BY tx_date DESC, id DESC LIMIT ? OFFSET ?'
+    ).bind(userId, PER_PAGE, offset).all();
+
     if (!rows.results?.length) return sendMessage(env, chatId, 'Belum ada transaksi.');
-    let out = `📒 <b>Riwayat (${rows.results.length})</b>\n`;
+
+    let out = `📒 <b>Riwayat (hal ${page}/${maxPage}, total ${total})</b>\n`;
     for (const r of rows.results) {
       const icon = r.type === 'income' ? '⬆️' : '⬇️';
       const sc = r.scope === 'keluarga' ? '🏠' : '🙋';
       out += `<code>#${r.id}</code> ${sc} ${icon} ${r.category}: ${rupiah(r.amount)} · ${r.tx_date}\n`;
     }
-    out += '\nHapus: <code>/hapus #id</code>\nEdit: <code>/edit #id 30000</code>';
-    return sendMessage(env, chatId, out.trim());
+    out += `\nHapus: <code>/hapus #id</code>\nEdit: <code>/edit #id 30000</code>`;
+
+    // Inline keyboard navigasi
+    const kb = { inline_keyboard: [] };
+    const nav = [];
+    if (page > 1) nav.push({ text: '⬅️ Seb', callback_data: `riwayat_prev_${page}` });
+    if (page < maxPage) nav.push({ text: 'Berikut ➡️', callback_data: `riwayat_next_${page}` });
+    if (nav.length) kb.inline_keyboard.push(nav);
+
+    return sendMessageKb(env, chatId, out.trim(), kb);
   }
 
-  // ==== /hapus — format ketat: hanya angka, gak boleh nyangkut kata ====
+  // ==== /hapus — 2-step: tampilkan detail + minta konfirmasi ====
   if (text === '/hapus' || text.startsWith('/hapus ')) {
     const arg = text.replace('/hapus', '').trim().replace(/^#/, ''); // buang # kalau ada
     // Hanya izinkan angka (dan optional #). Kalau ada huruf/kata → tolak.
@@ -697,18 +819,30 @@ async function handleMessage(env, msg) {
         `ID transaksi: 12 (bukan kata/keterangan).`);
     }
     const id = parseInt(arg, 10);
-    const res = await env.DB.prepare('DELETE FROM transactions WHERE id = ? AND user_id = ?')
-      .bind(id, userId).run();
-    if (res.meta.changes > 0) {
-      return sendMessage(env, chatId, `🗑️ Transaksi #${id} dihapus`);
+    // Ambil detail dulu buat ditampilkan
+    const tx = await env.DB.prepare('SELECT * FROM transactions WHERE id = ? AND user_id = ?')
+      .bind(id, userId).first();
+    if (!tx) {
+      return sendMessage(env, chatId, `❌ Transaksi #${id} gak ditemukan (atau bukan punyamu). Cek /riwayat buat ID yang bener.`);
     }
-    return sendMessage(env, chatId, `❌ Transaksi #${id} gak ditemukan (atau bukan punyamu). Cek /riwayat buat ID yang bener.`);
+    const icon = tx.type === 'income' ? '⬆️' : '⬇️';
+    const tgl = (tx.tx_date || '').slice(0, 10);
+    // Simpan state konfirmasi
+    await env.DB.prepare(
+      'INSERT OR REPLACE INTO pending_input (telegram_id, action, scope, category, data) VALUES (?, ?, ?, ?, ?)'
+    ).bind(userId, 'confirm_hapus', tx.scope, '', JSON.stringify({ id })).run();
+    return sendMessage(env, chatId,
+      `🗑️ <b>Yakin hapus transaksi ini?</b>\n\n` +
+      `${icon} #${id} · ${tx.scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi'} · ${tx.category}\n` +
+      `💰 <b>${rupiah(tx.amount)}</b> · 📅 ${tgl}\n` +
+      `${tx.note ? `📝 ${tx.note}\n` : ''}\n` +
+      `Ketik <b>ya</b> buat hapus, atau <b>batal</b>.`);
   }
 
   if (text.startsWith('/edit ')) {
     const parts = text.replace('/edit', '').trim().split(/\s+/);
     const id = parseInt(parts[0].replace(/[^0-9]/g, ''));
-    if (!id || parts.length < 2) {
+    if (!id) {
       return sendMessage(env, chatId, 'Format: /edit #123 30000 atau /edit #123 makan 30000');
     }
     // cek punya user
@@ -716,6 +850,26 @@ async function handleMessage(env, msg) {
       .bind(id, userId).first();
     if (!existing) return sendMessage(env, chatId, `❌ Transaksi #${id} gak ditemukan (atau bukan punyamu)`);
 
+    // Mode 1: /edit #id TANPA value → tampilkan rincian, tunggu input
+    if (parts.length < 2) {
+      const icon = existing.type === 'income' ? '⬆️' : '⬇️';
+      const tgl = (existing.tx_date || '').slice(0, 10);
+      await env.DB.prepare(
+        'INSERT OR REPLACE INTO pending_input (telegram_id, action, scope, category, data) VALUES (?, ?, ?, ?, ?)'
+      ).bind(userId, 'confirm_edit', existing.scope, '', JSON.stringify({ id })).run();
+      return sendMessage(env, chatId,
+        `✏️ <b>Rincian #${id}:</b>\n` +
+        `${icon} ${existing.scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi'} · ${existing.category}\n` +
+        `💰 <b>${rupiah(existing.amount)}</b> · 📅 ${tgl}\n` +
+        `${existing.note ? `📝 ${existing.note}\n` : ''}\n` +
+        `Ketik perubahan, misal:\n` +
+        `• <code>30000</code> (ubah nominal)\n` +
+        `• <code>makan</code> (ubah kategori)\n` +
+        `• <code>30000 makan</code> (keduanya)\n` +
+        `Atau <b>batal</b>.`);
+    }
+
+    // Mode 2: /edit #id <value> → langsung update (backward compatible)
     const rest = parts.slice(1).join(' ');
     const amountMatch = rest.match(/(\d+(?:[.,]\d+)?\s*(?:rb|k|jt|j|ribu|juta)?)$/i);
     const amount = amountMatch ? parseAmount(amountMatch[1]) : null;
