@@ -85,13 +85,6 @@ function parseAmount(str) {
   return Math.round(num);
 }
 
-// Helper: sekarang di WIB (UTC+7)
-function nowWIB() {
-  const d = new Date();
-  d.setHours(d.getHours() + 7); // shift ke WIB
-  return d;
-}
-
 // Parse tanggal relatif: "kemarin", "2 hari lalu", "3/8", "2026-08-02", default hari ini (WIB)
 function parseDate(str) {
   if (!str) return todayStr();
