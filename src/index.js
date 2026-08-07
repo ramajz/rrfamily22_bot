@@ -85,24 +85,31 @@ function parseAmount(str) {
   return Math.round(num);
 }
 
-// Parse tanggal relatif: "kemarin", "2 hari lalu", "3/8", "2026-08-02", default hari ini
+// Helper: sekarang di WIB (UTC+7)
+function nowWIB() {
+  const d = new Date();
+  d.setHours(d.getHours() + 7); // shift ke WIB
+  return d;
+}
+
+// Parse tanggal relatif: "kemarin", "2 hari lalu", "3/8", "2026-08-02", default hari ini (WIB)
 function parseDate(str) {
   if (!str) return todayStr();
   const s = String(str).trim().toLowerCase();
   if (s === 'kemarin') {
-    const d = new Date();
+    const d = nowWIB();
     d.setDate(d.getDate() - 1);
     return d.toISOString().slice(0, 10);
   }
   let m = s.match(/(\d+)\s*hari\s*(yang\s*)?lalu/); // "2 hari lalu", "3 hari yang lalu"
   if (m) {
-    const d = new Date();
+    const d = nowWIB();
     d.setDate(d.getDate() - parseInt(m[1], 10));
     return d.toISOString().slice(0, 10);
   }
   m = s.match(/^(\d{1,2})\/(\d{1,2})$/); // dd/mm
   if (m) {
-    const year = new Date().getFullYear();
+    const year = nowWIB().getFullYear();
     return `${year}-${String(m[2]).padStart(2, '0')}-${String(m[1]).padStart(2, '0')}`;
   }
   m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
@@ -110,9 +117,15 @@ function parseDate(str) {
   return todayStr();
 }
 
-function todayStr() {
+// Sekarang di WIB (UTC+7) — Cloudflare Workers jalan di UTC
+function nowWIB() {
   const d = new Date();
-  return d.toISOString().slice(0, 10);
+  d.setHours(d.getHours() + 7);
+  return d;
+}
+
+function todayStr() {
+  return nowWIB().toISOString().slice(0, 10);
 }
 
 function matchCategory(word, scope) {
