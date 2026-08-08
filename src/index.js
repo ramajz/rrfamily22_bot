@@ -424,13 +424,13 @@ async function handleCallback(env, cb) {
     const total = totalRow?.c || 0;
     const maxPage = Math.max(1, Math.ceil(total / PER_PAGE));
     const rows = await env.DB.prepare(
-      'SELECT id, scope, type, amount, category, tx_date, note FROM transactions WHERE user_id = ? ORDER BY tx_date DESC, id DESC LIMIT ? OFFSET ?'
+      'SELECT id, scope, type, amount, category, item, tx_date, note FROM transactions WHERE user_id = ? ORDER BY tx_date DESC, id DESC LIMIT ? OFFSET ?'
     ).bind(userId, PER_PAGE, offset).all();
-    let out = `📒 <b>Riwayat (hal ${page}/${maxPage}, total ${total})</b>\n`;
+    let out = `📒 <b>Riwayat (hal ${page}/${maxPage}, total ${total})</b>\\n`;
     for (const r of rows.results || []) {
       const icon = r.type === 'income' ? '⬆️' : '⬇️';
       const sc = r.scope === 'keluarga' ? '🏠' : '🙋';
-      out += `<code>#${r.id}</code> ${sc} ${icon} ${r.category}: ${rupiah(r.amount)} · ${r.tx_date}\n`;
+      out += `<code>#${r.id}</code> ${sc} ${icon} ${r.item || r.category}: ${rupiah(r.amount)} · ${r.tx_date}\\n`;
     }
     out += `\nHapus: <code>/hapus #id</code>\nEdit: <code>/edit #id 30000</code>`;
     const kb = { inline_keyboard: [] };
@@ -819,7 +819,7 @@ async function handleMessage(env, msg) {
     const maxPage = Math.max(1, Math.ceil(total / PER_PAGE));
 
     const rows = await env.DB.prepare(
-      'SELECT id, scope, type, amount, category, tx_date, note FROM transactions WHERE user_id = ? ORDER BY tx_date DESC, id DESC LIMIT ? OFFSET ?'
+      'SELECT id, scope, type, amount, category, item, tx_date, note FROM transactions WHERE user_id = ? ORDER BY tx_date DESC, id DESC LIMIT ? OFFSET ?'
     ).bind(userId, PER_PAGE, offset).all();
 
     if (!rows.results?.length) return sendMessage(env, chatId, 'Belum ada transaksi.');
@@ -828,7 +828,7 @@ async function handleMessage(env, msg) {
     for (const r of rows.results) {
       const icon = r.type === 'income' ? '⬆️' : '⬇️';
       const sc = r.scope === 'keluarga' ? '🏠' : '🙋';
-      out += `<code>#${r.id}</code> ${sc} ${icon} ${r.category}: ${rupiah(r.amount)} · ${r.tx_date}\n`;
+      out += `<code>#${r.id}</code> ${sc} ${icon} ${r.item || r.category}: ${rupiah(r.amount)} · ${r.tx_date}\n`;
     }
     out += `\nHapus: <code>/hapus #id</code>\nEdit: <code>/edit #id 30000</code>`;
 
