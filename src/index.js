@@ -63,6 +63,24 @@ async function answerCallback(env, callbackId, text) {
     body: JSON.stringify({ callback_query_id: callbackId, text }),
   });
 }
+// Kirim file document ke Telegram (CSV export)
+async function sendDocument(env, chatId, filename, fileContent, caption) {
+  const url = `https://api.telegram.org/bot${env.BOT_TOKEN}/sendDocument`;
+  const boundary = '----FormBoundary' + Math.random().toString(36).slice(2);
+  const LF = '\r\n';
+  const parts = [];
+  parts.push(`--${boundary}${LF}Content-Disposition: form-data; name="chat_id"${LF}${LF}${chatId}`);
+  parts.push(`--${boundary}${LF}Content-Disposition: form-data; name="document"; filename="${filename}"${LF}Content-Type: text/csv${LF}${LF}${fileContent}`);
+  if (caption) parts.push(`--${boundary}${LF}Content-Disposition: form-data; name="caption"${LF}${LF}${caption}`);
+  parts.push(`--${boundary}--${LF}`);
+  const body = parts.join(LF);
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
+    body,
+  });
+  return res.json();
+}
 
 function isWhitelisted(userId) {
   return String(userId) in WHITELIST;
@@ -70,6 +88,15 @@ function isWhitelisted(userId) {
 
 function rupiah(n) {
   return 'Rp' + Number(n).toLocaleString('id-ID');
+}
+// Escape CSV field
+function csvEscape(val) {
+  if (val == null) return '';
+  const s = String(val);
+  if (s.includes(',') || s.includes('"') || s.includes('\n')) {
+    return '"' + s.replace(/"/g, '""') + '"';
+  }
+  return s;
 }
 
 // Parse angka: "25rb" / "25000" / "25.000" / "1jt" / "1,5jt" / "1.5jt"
@@ -644,7 +671,8 @@ async function handleMessage(env, msg) {
       `/kategori tambah "nama"\n` +
       `/saldo — saldo total\n` +
       `/setprib — ubah scope default ke Pribadi\n` +
-      `/setkel — ubah scope default ke Keluarga`
+      `/setkel — ubah scope default ke Keluarga\n` +
+      `/export — export CSV bulan ini (atau: /export 2026-08)`
     );
   }
 
@@ -958,12 +986,76 @@ async function handleMessage(env, msg) {
       .bind(userId, name, 'keluarga', 'keluarga').run();
     return sendMessage(env, chatId, '✅ Scope default kamu sekarang: <b>Keluarga</b>');
   }
+  // ==== /export — kirim CSV file ke Telegram ====
+  if (text === '/export' || text.startsWith('/export ')) {
+  const arg = text.replace('/export', '').trim();
+  let filterMonth = '';
+  let filterScope = '';
+  let periodLabel = 'semua';
+
+  const parts = arg.split(/\s+/).filter(Boolean);
+  for (const p of parts) {
+    if (/^\d{4}-\d{2}$/.test(p)) {
+      filterMonth = p;
+      periodLabel = p;
+    } else if (p === 'keluarga' || p === 'pribadi' || p === 'prib') {
+      filterScope = p === 'prib' ? 'pribadi' : p;
+      periodLabel += ` (${filterScope})`;
+    } else if (p === 'all') {
+      periodLabel = 'semua';
+    }
+  }
+
+  // Default: bulan ini (WIB)
+  if (!filterMonth && !arg) {
+    filterMonth = todayStr().slice(0, 7);
+    periodLabel = filterMonth;
+  }
+
+  let query = 'SELECT id, scope, type, amount, category, note, item, tx_date FROM transactions WHERE user_id = ?';
+  const params = [userId];
+  if (filterMonth) {
+    query += ' AND tx_date LIKE ?';
+    params.push(filterMonth + '%');
+  }
+  if (filterScope) {
+    query += ' AND scope = ?';
+    params.push(filterScope);
+  }
+  query += ' ORDER BY tx_date ASC, id ASC';
+
+  const rows = await env.DB.prepare(query).bind(...params).all();
+  const results = rows.results || [];
+
+  if (!results.length) {
+    return sendMessage(env, chatId, `📭 Tidak ada transaksi untuk periode <b>${periodLabel}</b>.`);
+  }
+
+  // Build CSV
+  const header = 'id,scope,type,amount,category,note,item,tx_date';
+  const csvRows = results.map(r =>
+    [r.id, r.scope, r.type, r.amount, csvEscape(r.category), csvEscape(r.note), csvEscape(r.item), r.tx_date].join(',')
+  );
+  const csv = header + '\n' + csvRows.join('\n');
+  const filename = `rrfamily-${filterMonth || 'all'}.csv`;
+  const total = results.length;
+  const totalExpense = results.filter(r => r.type === 'expense').reduce((s, r) => s + r.amount, 0);
+  const totalIncome = results.filter(r => r.type === 'income').reduce((s, r) => s + r.amount, 0);
+  const caption = `📊 Export ${periodLabel}\n${total} transaksi · Expense: ${rupiah(totalExpense)} · Income: ${rupiah(totalIncome)}`;
+
+  await sendMessage(env, chatId, '⏳ Membuat CSV...');
+  const sent = await sendDocument(env, chatId, filename, csv, caption);
+  if (sent.ok) {
+    return; // file sudah terkirim
+  }
+  return sendMessage(env, chatId, `⚠️ Gagal kirim file: ${sent.description || 'unknown error'}`);
+  }
 
   // ==== Free-text parse (AI) ====
   // Guard: teks diawali "/" tapi bukan command dikenal → jangan masuk AI parse
   // (mencegah "hapus makan 25rb" salah dicatat sebagai transaksi)
   const KNOWN_CMDS = ['/start', '/help', '/sisa', '/rekap', '/analisis', '/budget', '/riwayat',
-    '/hapus', '/edit', '/kategori', '/saldo', '/setprib', '/setkel', '/harga'];
+  '/hapus', '/edit', '/kategori', '/saldo', '/setprib', '/setkel', '/harga', '/export'];
   if (text.startsWith('/') && !KNOWN_CMDS.some(c => text === c || text.startsWith(c + ' '))) {
     return sendMessage(env, chatId,
       `❓ Command <code>${text.split(' ')[0]}</code> gak dikenal.\n` +
