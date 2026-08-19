@@ -169,16 +169,16 @@ async function deleteCategoryFromDb(db, scope, name) {
 function regexParse(text) {
   // Try to parse: "[item] [amount]"
   // Examples: "mie apong 50rb", "bensin 75rb", "listrik 350.000"
-  const s = text.trim().toLowerCase();
+  const s = text.trim().toLowerCase().replace(/[\n\r\t]+/g, ' ').replace(/\s+/g, ' ');
 
   // Pattern: everything before the amount = item
   // Amount patterns: 50rb, 50k, 50ribu, 50.000, 50000, 1jt, 1juta
   const amountPatterns = [
-    /(\d+(?:[.,]\d+)?)\s*(rb|k|ribu)/,
-    /(\d+(?:[.,]\d+)?)\s*(jt|j|juta)/,
-    /rp\.?\s*(\d+(?:[.,]\d+)?)/,
-    /(\d{1,3}(?:[.,]\d{3})+(?:[.,]\d+)?)/,  // 35.000 or 350.000
-    /(\d+)/
+    /(\d+(?:[.,]\d+)?)\s*(rb|k|ribu)\b/,
+    /(\d+(?:[.,]\d+)?)\s*(jt|j|juta)\b/,
+    /rp\.?\s*(\d+(?:[.,]\d+)?)\b/,
+    /(\d{1,3}(?:[.,]\d{3})+(?:[.,]\d+)?)\b/,  // 35.000 or 350.000
+    /(\d+)\b/
   ];
 
   let amount = null;
@@ -901,6 +901,52 @@ async function handleCallback(env, cb) {
     await env.DB.prepare('UPDATE transactions SET category = ? WHERE id = ?').bind(newCategory, txId).run();
     await answerCallback(env, cb.id, `Kategori: ${newCategory}`);
     return sendMessage(env, chatId, `✅ Kategori #${txId} diubah ke <b>${newCategory}</b>.`);
+  }
+
+  // ---- Regex Catat: Save transaction from regex parse ----
+  if (data.startsWith('regex_cat_')) {
+    // Format: regex_cat_{scope}_{category}_{amount}_{date}
+    const rest = data.replace('regex_cat_', '');
+    // Split from the end: date is always YYYY-MM-DD (10 chars), amount is numeric
+    const dateMatch = rest.match(/_(\d{4}-\d{2}-\d{2})$/);
+    if (!dateMatch) {
+      await answerCallback(env, cb.id, 'Error');
+      return sendMessage(env, chatId, '❌ Format callback salah.');
+    }
+    const date = dateMatch[1];
+    const beforeDate = rest.slice(0, rest.lastIndexOf('_' + date));
+    // beforeDate = "scope_category_amount"
+    const lastUnderscore = beforeDate.lastIndexOf('_');
+    const amountStr = beforeDate.slice(lastUnderscore + 1);
+    const beforeAmount = beforeDate.slice(0, lastUnderscore);
+    const firstUnderscore = beforeAmount.indexOf('_');
+    const scope = beforeAmount.slice(0, firstUnderscore);
+    const category = beforeAmount.slice(firstUnderscore + 1);
+    const amount = parseInt(amountStr);
+
+    if (!amount || !category || !scope) {
+      await answerCallback(env, cb.id, 'Error');
+      return sendMessage(env, chatId, '❌ Data tidak lengkap.');
+    }
+
+    // Get pendingItem from state if available
+    const st = getState(userId);
+    const item = st.pendingItem || null;
+    st.pendingItem = null;
+
+    await handleCatat(env, userId, scope, 'expense', amount, category, `regex: ${item || category}`, date, item);
+
+    // Track undo
+    const newTx = await env.DB.prepare('SELECT id FROM transactions WHERE user_id = ? ORDER BY id DESC LIMIT 1').bind(userId).first();
+    if (newTx) st.lastUndoId = newTx.id;
+
+    const scopeLabel = scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi';
+    let reply = `✅ Dicatat!\n${scopeLabel} · ⬇️ ${category} · <b>${rupiah(amount)}</b>`;
+    const alert = await checkBudgetAlert(env, scope, amount);
+    if (alert) reply += '\n\n' + alert;
+
+    await answerCallback(env, cb.id, 'Tersimpan');
+    return sendMessageKb(env, chatId, reply, mainMenuKeyboard());
   }
 
   // ---- Hapus Start ----
