@@ -220,7 +220,10 @@ async function regexCategoryPicker(db, scope, item, amount, date) {
     if (row.length === 3) { kb.inline_keyboard.push(row); row = []; }
   }
   if (row.length) kb.inline_keyboard.push(row);
-  kb.inline_keyboard.push([{ text: '❌ Batal', callback_data: 'cancel_catat' }]);
+  kb.inline_keyboard.push([
+    { text: '📅 Kemarin', callback_data: `regex_date_${scope}_${amount}_kemarin` },
+    { text: '❌ Batal', callback_data: 'cancel_catat' },
+  ]);
   return kb;
 }
 
@@ -990,6 +993,36 @@ async function handleCallback(env, cb) {
     await answerCallback(env, cb.id, 'Set budget');
     const label = scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi';
     return sendMessage(env, chatId, `💰 Budget <b>${label}</b> berapa?\n\nKetik nominal, contoh: <code>7jt</code> atau <code>1500rb</code>`);
+  }
+
+  // ---- Cancel catat ----
+  if (data === 'cancel_catat') {
+    st.pendingItem = null;
+    await answerCallback(env, cb.id, 'Dibatalkan');
+    return sendMessageKb(env, chatId, '🗑️ Catatan dibatalkan.', mainMenuKeyboard());
+  }
+
+  // ---- Pilih tanggal untuk regex catat ----
+  if (data.startsWith('regex_date_')) {
+    // Format: regex_date_{scope}_{amount}_{relativeDate}
+    const rest = data.replace('regex_date_', '');
+    const parts = rest.split('_');
+    const relativeDate = parts.pop();
+    const amount = parseInt(parts.pop());
+    const scope = parts.join('_');
+    const item = st.pendingItem || 'item';
+    const date = parseDate(relativeDate);
+    const cats = await getCategories(env.DB, scope);
+    const kb = { inline_keyboard: [] };
+    let row = [];
+    for (const c of cats) {
+      row.push({ text: c, callback_data: `regex_cat_${scope}_${c}_${amount}_${date}` });
+      if (row.length === 3) { kb.inline_keyboard.push(row); row = []; }
+    }
+    if (row.length) kb.inline_keyboard.push(row);
+    kb.inline_keyboard.push([{ text: '❌ Batal', callback_data: 'cancel_catat' }]);
+    await answerCallback(env, cb.id, 'Tanggal: kemarin');
+    return sendMessageKb(env, chatId, `📅 <b>Kemarin</b> · ${item} · ${rupiah(amount)}\n\nPilih kategori:`, kb);
   }
 
   // ---- Kategori ----
