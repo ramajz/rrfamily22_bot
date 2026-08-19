@@ -26,7 +26,7 @@ const userState = {};
 
 function getState(userId) {
   if (!userState[userId]) {
-    userState[userId] = { lastUndoId: null, awaitingDeleteSearch: false, awaitingBudgetScope: null, awaitingCategoryName: false };
+    userState[userId] = { lastUndoId: null, awaitingDeleteSearch: false, awaitingBudgetScope: null, awaitingCategoryName: false, awaitingEditNominal: null, awaitingCategoryRename: null };
   }
   return userState[userId];
 }
@@ -119,6 +119,111 @@ function parseAmount(str) {
   return Math.round(num);
 }
 
+// ============ D1 Category Functions ============
+async function seedCategories(db) {
+  // Seed default categories from code into D1 (INSERT OR IGNORE)
+  for (const [scope, cats] of Object.entries(DEFAULT_CATEGORIES)) {
+    for (const name of cats) {
+      await db.prepare(
+        'INSERT OR IGNORE INTO categories (scope, name, type, is_default) VALUES (?, ?, ?, 1)'
+      ).bind(scope, name, 'expense').run();
+    }
+  }
+}
+
+async function getCategories(db, scope) {
+  const rows = await db.prepare(
+    'SELECT name FROM categories WHERE scope = ? AND type = ? ORDER BY id'
+  ).bind(scope, 'expense').all();
+  if (rows.results.length === 0) {
+    // Empty → seed defaults first, then re-read
+    await seedCategories(db);
+    const retry = await db.prepare(
+      'SELECT name FROM categories WHERE scope = ? AND type = ? ORDER BY id'
+    ).bind(scope, 'expense').all();
+    return retry.results.map(r => r.name);
+  }
+  return rows.results.map(r => r.name);
+}
+
+async function addCategoryToDb(db, scope, name) {
+  await db.prepare(
+    'INSERT OR IGNORE INTO categories (scope, name, type, is_default) VALUES (?, ?, ?, 0)'
+  ).bind(scope, name, 'expense').run();
+}
+
+async function renameCategoryInDb(db, scope, oldName, newName) {
+  const result = await db.prepare(
+    'UPDATE categories SET name = ? WHERE scope = ? AND name = ? AND type = ?'
+  ).bind(newName, scope, oldName, 'expense').run();
+  return result.meta?.changes > 0;
+}
+
+async function deleteCategoryFromDb(db, scope, name) {
+  const result = await db.prepare(
+    'DELETE FROM categories WHERE scope = ? AND name = ? AND type = ? AND is_default = 0'
+  ).bind(scope, name, 'expense').run();
+  return result.meta?.changes > 0;
+}
+
+function regexParse(text) {
+  // Try to parse: "[item] [amount]"
+  // Examples: "mie apong 50rb", "bensin 75rb", "listrik 350.000"
+  const s = text.trim().toLowerCase();
+
+  // Pattern: everything before the amount = item
+  // Amount patterns: 50rb, 50k, 50ribu, 50.000, 50000, 1jt, 1juta
+  const amountPatterns = [
+    /(\d+(?:[.,]\d+)?)\s*(rb|k|ribu)/,
+    /(\d+(?:[.,]\d+)?)\s*(jt|j|juta)/,
+    /rp\.?\s*(\d+(?:[.,]\d+)?)/,
+    /(\d{1,3}(?:[.,]\d{3})+(?:[.,]\d+)?)/,  // 35.000 or 350.000
+    /(\d+)/
+  ];
+
+  let amount = null;
+  let amountEnd = s.length;
+
+  for (const pat of amountPatterns) {
+    const m = s.match(pat);
+    if (m) {
+      amount = parseAmount(m[0]);
+      if (amount) {
+        amountEnd = s.indexOf(m[0]);
+        break;
+      }
+    }
+  }
+
+  if (!amount || amountEnd === 0) return null;
+
+  // Item = text before amount
+  let item = s.substring(0, amountEnd).trim();
+  // Clean up common prefixes
+  item = item.replace(/^(beli|bayar|buat|isi|isi ulang|top up|transfer)\s+/i, '');
+  item = item.replace(/\s+/g, ' ').trim();
+
+  if (!item || item.length < 2) return null;
+
+  // Capitalize first letter
+  item = item.charAt(0).toUpperCase() + item.slice(1);
+
+  return { item, amount };
+}
+
+async function regexCategoryPicker(db, scope, item, amount, date) {
+  const cats = await getCategories(db, scope);
+  const kb = { inline_keyboard: [] };
+  let row = [];
+  for (const c of cats) {
+    row.push({ text: c, callback_data: `regex_cat_${scope}_${c}_${amount}_${date}` });
+    if (row.length === 3) { kb.inline_keyboard.push(row); row = []; }
+  }
+  if (row.length) kb.inline_keyboard.push(row);
+  kb.inline_keyboard.push([{ text: '❌ Batal', callback_data: 'cancel_catat' }]);
+  return kb;
+}
+
 function parseDate(str) {
   if (!str) return todayStr();
   const s = String(str).trim().toLowerCase();
@@ -153,10 +258,10 @@ function todayStr() {
   return nowWIB().toISOString().slice(0, 10);
 }
 
-function matchCategory(word, scope) {
+async function matchCategory(db, word, scope) {
   if (!word) return null;
   const w = word.toLowerCase();
-  const cats = [...DEFAULT_CATEGORIES[scope], ...INCOME_CATEGORIES];
+  const cats = [...(await getCategories(db, scope)), ...INCOME_CATEGORIES];
   const found = cats.find(c => c.toLowerCase() === w || c.toLowerCase().startsWith(w) || w.startsWith(c.toLowerCase()));
   return found || null;
 }
@@ -214,8 +319,10 @@ async function callAI(env, { system, user, model, visionBase64 }) {
 }
 
 // AI Parse — now with action detection for intent routing
-async function aiParse(env, text, defaultScope, categories) {
-  const catList = [...new Set([...(categories?.keluarga || DEFAULT_CATEGORIES.keluarga), ...(categories?.pribadi || DEFAULT_CATEGORIES.pribadi)])].join(', ');
+async function aiParse(env, text, defaultScope) {
+  const keluargaCats = await getCategories(env.DB, 'keluarga');
+  const pribadiCats = await getCategories(env.DB, 'pribadi');
+  const catList = [...new Set([...keluargaCats, ...pribadiCats])].join(', ');
   const system = `Kamu adalah asisten keuangan keluarga. Analisis pesan user (bahasa Indonesia) dan jawab HANYA JSON:
 
 {
@@ -248,8 +355,8 @@ Aturan untuk action=catat:
 - date: "kemarin" = tanggal kemarin. null = hari ini.
 
 KATEGORI YANG TERSEDIA:
-Keluarga: ${(categories?.keluarga || DEFAULT_CATEGORIES.keluarga).join(', ')}
-Pribadi: ${(categories?.pribadi || DEFAULT_CATEGORIES.pribadi).join(', ')}
+Keluarga: ${keluargaCats.join(', ')}
+Pribadi: ${pribadiCats.join(', ')}
 Income: ${INCOME_CATEGORIES.join(', ')}
 
 Jangan tambahkan teks lain, HANYA JSON.`;
@@ -434,8 +541,8 @@ function settingsKeyboard(scope) {
   };
 }
 
-function categoryPickerKeyboard(txId, scope) {
-  const cats = DEFAULT_CATEGORIES[scope] || DEFAULT_CATEGORIES.keluarga;
+async function categoryPickerKeyboard(db, txId, scope) {
+  const cats = await getCategories(db, scope);
   const kb = { inline_keyboard: [] };
   let row = [];
   for (const c of cats) {
@@ -476,9 +583,37 @@ function categoryManagementKeyboard() {
   return {
     inline_keyboard: [
       [{ text: '➕ Tambah Kategori', callback_data: 'kategori_add' }],
+      [{ text: '✏️ Edit/Rename', callback_data: 'kategori_edit_list' }],
+      [{ text: '🗑️ Hapus Kategori', callback_data: 'kategori_hapus_list' }],
       [{ text: '⬅️ Kembali', callback_data: 'settings' }],
     ],
   };
+}
+
+async function categoryEditKeyboard(db, scope) {
+  const cats = await getCategories(db, scope);
+  const kb = { inline_keyboard: [] };
+  let row = [];
+  for (const c of cats) {
+    row.push({ text: c, callback_data: `kategori_edit_${scope}_${c}` });
+    if (row.length === 2) { kb.inline_keyboard.push(row); row = []; }
+  }
+  if (row.length) kb.inline_keyboard.push(row);
+  kb.inline_keyboard.push([{ text: '⬅️ Kembali', callback_data: 'kategori' }]);
+  return kb;
+}
+
+async function categoryHapusKeyboard(db, scope) {
+  const cats = await getCategories(db, scope);
+  const kb = { inline_keyboard: [] };
+  let row = [];
+  for (const c of cats) {
+    row.push({ text: '🗑️ ' + c, callback_data: `kategori_hapus_${scope}_${c}` });
+    if (row.length === 2) { kb.inline_keyboard.push(row); row = []; }
+  }
+  if (row.length) kb.inline_keyboard.push(row);
+  kb.inline_keyboard.push([{ text: '⬅️ Kembali', callback_data: 'kategori' }]);
+  return kb;
 }
 
 function deleteSearchResultKeyboard(transactions) {
@@ -546,14 +681,26 @@ async function showRiwayat(env, chatId, userId, page = 1) {
     'SELECT id, scope, type, amount, category, item, tx_date, note FROM transactions WHERE user_id = ? ORDER BY tx_date DESC, id DESC LIMIT ? OFFSET ?'
   ).bind(userId, PER_PAGE, offset).all();
 
-  let out = `📒 <b>Riwayat (hal ${page}/${maxPage}, total ${total})</b>\n`;
+  let out = `📒 <b>Riwayat (hal ${page}/${maxPage}, total ${total})</b>\n\nPilih transaksi untuk edit/hapus:`;
+
+  // Build buttons per item
+  const txButtons = [];
   for (const r of rows.results || []) {
     const icon = r.type === 'income' ? '⬆️' : '⬇️';
     const sc = r.scope === 'keluarga' ? '🏠' : '🙋';
-    out += `<code>#${r.id}</code> ${sc} ${icon} ${r.item || r.category}: ${rupiah(r.amount)} · ${r.tx_date}\n`;
+    const label = `${sc} ${icon} ${r.item || r.category} ${rupiah(r.amount)}`;
+    txButtons.push([{ text: label, callback_data: `tx_detail_${r.id}` }]);
   }
 
-  return sendMessageKb(env, chatId, out.trim(), riwayatKeyboard(page, maxPage));
+  const nav = [];
+  if (page > 1) nav.push({ text: '⬅️ Prev', callback_data: `riwayat_${page - 1}` });
+  if (page < maxPage) nav.push({ text: 'Next ➡️', callback_data: `riwayat_${page + 1}` });
+
+  const kb = { inline_keyboard: [...txButtons] };
+  if (nav.length) kb.inline_keyboard.push(nav);
+  kb.inline_keyboard.push([{ text: '🏠 Menu', callback_data: 'menu_main' }]);
+
+  return sendMessageKb(env, chatId, out.trim(), kb);
 }
 
 async function showSettings(env, chatId, userId) {
@@ -566,7 +713,7 @@ async function showSettings(env, chatId, userId) {
 }
 
 async function showCategoryPicker(env, chatId, txId, scope) {
-  return sendMessageKb(env, chatId, '🏷️ Pilih kategori baru:', categoryPickerKeyboard(txId, scope));
+  return sendMessageKb(env, chatId, '🏷️ Pilih kategori baru:', await categoryPickerKeyboard(env.DB, txId, scope));
 }
 
 async function showBudgetMenu(env, chatId) {
@@ -585,7 +732,8 @@ async function showCategoryManagement(env, chatId) {
   let out = '🏷️ <b>Kategori</b>\n\n';
   for (const sc of ['keluarga', 'pribadi']) {
     const label = sc === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi';
-    out += `<b>${label}</b>: ${DEFAULT_CATEGORIES[sc].join(', ')}\n`;
+    const cats = await getCategories(env.DB, sc);
+    out += `<b>${label}</b>: ${cats.join(', ')}\n`;
   }
   return sendMessageKb(env, chatId, out, categoryManagementKeyboard());
 }
@@ -611,6 +759,53 @@ async function handleCallback(env, cb) {
   st.awaitingDeleteSearch = false;
   st.awaitingBudgetScope = null;
   st.awaitingCategoryName = false;
+  st.awaitingEditNominal = null;
+  st.awaitingCategoryRename = null;
+
+  // ---- TX Detail (edit/hapus dari riwayat) ----
+  if (data.startsWith('tx_detail_')) {
+    const txId = parseInt(data.replace('tx_detail_', ''));
+    const tx = await env.DB.prepare('SELECT * FROM transactions WHERE id = ? AND user_id = ?').bind(txId, userId).first();
+    if (!tx) return sendMessage(env, chatId, '❌ Transaksi gak ditemukan.');
+    const icon = tx.type === 'income' ? '⬆️' : '⬇️';
+    const sc = tx.scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi';
+    const detail = `📋 <b>Transaksi #${tx.id}</b>\n\n${sc} · ${icon} ${tx.category}\nItem: ${tx.item || '-'}\nNominal: <b>${rupiah(tx.amount)}</b>\nTanggal: ${tx.tx_date}\nNote: ${tx.note || '-'}`;
+    return sendMessageKb(env, chatId, detail, {
+      inline_keyboard: [
+        [{ text: '✏️ Edit Kategori', callback_data: `ubah_kategori_${tx.id}` }],
+        [{ text: '✏️ Edit Nominal', callback_data: `edit_nominal_${tx.id}` }],
+        [{ text: '🗑️ Hapus', callback_data: `hapus_tx_${tx.id}` }],
+        [{ text: '🔙 Kembali', callback_data: 'riwayat_1' }]
+      ]
+    });
+  }
+
+  // ---- Edit Nominal ----
+  if (data.startsWith('edit_nominal_')) {
+    const txId = parseInt(data.replace('edit_nominal_', ''));
+    st.awaitingEditNominal = txId;
+    return sendMessage(env, chatId, `💰 Ketik nominal baru untuk #${txId}:\nContoh: <code>35rb</code> atau <code>75000</code>`);
+  }
+
+  // ---- Hapus dari riwayat ----
+  if (data.startsWith('hapus_tx_') && !data.startsWith('hapus_tx_confirm_')) {
+    const txId = parseInt(data.replace('hapus_tx_', ''));
+    const tx = await env.DB.prepare('SELECT * FROM transactions WHERE id = ? AND user_id = ?').bind(txId, userId).first();
+    if (!tx) return sendMessage(env, chatId, '❌ Transaksi gak ditemukan.');
+    return sendMessageKb(env, chatId,
+      `🗑️ Hapus transaksi ini?\n\n${tx.item || tx.category} · ${rupiah(tx.amount)} · ${tx.tx_date}`,
+      { inline_keyboard: [
+        [{ text: '✅ Ya, Hapus', callback_data: `hapus_tx_confirm_${tx.id}` }],
+        [{ text: '❌ Batal', callback_data: 'riwayat_1' }]
+      ]}
+    );
+  }
+
+  if (data.startsWith('hapus_tx_confirm_')) {
+    const txId = parseInt(data.replace('hapus_tx_confirm_', ''));
+    await env.DB.prepare('DELETE FROM transactions WHERE id = ? AND user_id = ?').bind(txId, userId).run();
+    return sendMessageKb(env, chatId, '🗑️ Transaksi dihapus.', mainMenuKeyboard());
+  }
 
   // ---- Main Menu ----
   if (data === 'menu_main') {
@@ -764,6 +959,69 @@ async function handleCallback(env, cb) {
     return sendMessage(env, chatId, '📝 Ketik nama kategori baru:\n\nContoh: <code>dana darurat</code> atau <code>gift</code>');
   }
 
+  // ---- Kategori Edit List ----
+  if (data === 'kategori_edit_list') {
+    await answerCallback(env, cb.id, 'Edit kategori');
+    const keluargaCats = await getCategories(env.DB, 'keluarga');
+    const pribadiCats = await getCategories(env.DB, 'pribadi');
+    let out = '✏️ <b>Edit Kategori</b>\n\n🏠 Keluarga:\n';
+    out += keluargaCats.join(', ') + '\n\n🙋 Pribadi:\n';
+    out += pribadiCats.join(', ') + '\n\nPilih kategori yang mau di-rename:';
+    const kb = { inline_keyboard: [] };
+    for (const sc of ['keluarga', 'pribadi']) {
+      const cats = sc === 'keluarga' ? keluargaCats : pribadiCats;
+      const label = sc === 'keluarga' ? '🏠' : '🙋';
+      for (const c of cats) {
+        kb.inline_keyboard.push([{ text: `${label} ${c}`, callback_data: `kategori_edit_${sc}_${c}` }]);
+      }
+    }
+    kb.inline_keyboard.push([{ text: '⬅️ Kembali', callback_data: 'kategori' }]);
+    return sendMessageKb(env, chatId, out, kb);
+  }
+
+  // ---- Kategori Edit ----
+  if (data.startsWith('kategori_edit_') && !data.endsWith('_list')) {
+    const parts = data.replace('kategori_edit_', '').split('_');
+    const scope = parts[0];
+    const oldName = parts.slice(1).join('_');
+    st.awaitingCategoryRename = { scope, oldName };
+    await answerCallback(env, cb.id, oldName);
+    return sendMessage(env, chatId, `✏️ Rename "<b>${oldName}</b>" ke apa?\n\nKetik nama baru:`);
+  }
+
+  // ---- Kategori Hapus List ----
+  if (data === 'kategori_hapus_list') {
+    await answerCallback(env, cb.id, 'Hapus kategori');
+    const keluargaCats = await getCategories(env.DB, 'keluarga');
+    const pribadiCats = await getCategories(env.DB, 'pribadi');
+    let out = '🗑️ <b>Hapus Kategori</b>\n\nPilih kategori yang mau dihapus:';
+    const kb = { inline_keyboard: [] };
+    for (const sc of ['keluarga', 'pribadi']) {
+      const cats = sc === 'keluarga' ? keluargaCats : pribadiCats;
+      const label = sc === 'keluarga' ? '🏠' : '🙋';
+      for (const c of cats) {
+        kb.inline_keyboard.push([{ text: `🗑️ ${label} ${c}`, callback_data: `kategori_hapus_${sc}_${c}` }]);
+      }
+    }
+    kb.inline_keyboard.push([{ text: '⬅️ Kembali', callback_data: 'kategori' }]);
+    return sendMessageKb(env, chatId, out, kb);
+  }
+
+  // ---- Kategori Hapus ----
+  if (data.startsWith('kategori_hapus_') && !data.endsWith('_list')) {
+    const parts = data.replace('kategori_hapus_', '').split('_');
+    const scope = parts[0];
+    const catName = parts.slice(1).join('_');
+    // Remove from D1
+    const deleted = await deleteCategoryFromDb(env.DB, scope, catName);
+    if (deleted) {
+      await answerCallback(env, cb.id, 'Dihapus');
+      return sendMessage(env, chatId, `🗑️ Kategori "<b>${catName}</b>" dihapus dari ${scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi'}.`);
+    }
+    await answerCallback(env, cb.id, 'Gak ditemukan');
+    return sendMessage(env, chatId, `❌ Kategori "${catName}" gak ditemukan atau kategori default.`);
+  }
+
   // ---- Export CSV ----
   if (data === 'export_csv') {
     await answerCallback(env, cb.id, 'Export...');
@@ -854,7 +1112,7 @@ async function handleMessage(env, msg) {
 
       const scope = parsed.scope || defaultScope;
       const type = parsed.type || 'expense';
-      const category = matchCategory(parsed.category, scope) || 'Lainnya';
+      const category = (await matchCategory(env.DB, parsed.category, scope)) || 'Lainnya';
       const date = parsed.date || todayStr();
 
       // Normalize items
@@ -971,6 +1229,34 @@ async function handleMessage(env, msg) {
     return sendMessageKb(env, chatId, `✅ Budget <b>${label}</b> = ${rupiah(amount)}/bulan`, budgetMenuKeyboard());
   }
 
+  // Awaiting: Edit nominal
+  if (st.awaitingEditNominal) {
+    const txId = st.awaitingEditNominal;
+    st.awaitingEditNominal = null;
+    const amount = parseAmount(text);
+    if (!amount) {
+      return sendMessage(env, chatId, '⚠️ Nominal gak valid. Ketik angka, contoh: <code>35rb</code> atau <code>75000</code>');
+    }
+    await env.DB.prepare('UPDATE transactions SET amount = ? WHERE id = ? AND user_id = ?').bind(amount, txId, userId).run();
+    return sendMessageKb(env, chatId, `✅ Nominal #${txId} diupdate ke ${rupiah(amount)}`, mainMenuKeyboard());
+  }
+
+  // Awaiting: Category rename
+  if (st.awaitingCategoryRename) {
+    const { scope, oldName } = st.awaitingCategoryRename;
+    st.awaitingCategoryRename = null;
+    const newName = text.trim();
+    if (!newName || newName.length < 2) {
+      return sendMessage(env, chatId, '⚠️ Nama kategori terlalu pendek. Ketik nama baru.');
+    }
+    const formatted = newName.charAt(0).toUpperCase() + newName.slice(1).toLowerCase();
+    const renamed = await renameCategoryInDb(env.DB, scope, oldName, formatted);
+    if (renamed) {
+      return sendMessageKb(env, chatId, `✅ "<b>${oldName}</b>" → "<b>${formatted}</b>"`, categoryManagementKeyboard());
+    }
+    return sendMessage(env, chatId, `❌ Kategori "${oldName}" gak ditemukan.`);
+  }
+
   // Awaiting: Category name
   if (st.awaitingCategoryName) {
     st.awaitingCategoryName = false;
@@ -979,17 +1265,33 @@ async function handleMessage(env, msg) {
       return sendMessage(env, chatId, '⚠️ Nama kategori terlalu pendek. Ketik nama kategori, contoh: <code>dana darurat</code>');
     }
     const formatted = catName.charAt(0).toUpperCase() + catName.slice(1).toLowerCase();
+    // Add to D1 for both scopes
     for (const sc of ['keluarga', 'pribadi']) {
-      if (!DEFAULT_CATEGORIES[sc].includes(formatted)) DEFAULT_CATEGORIES[sc].push(formatted);
+      await addCategoryToDb(env.DB, sc, formatted);
     }
     return sendMessageKb(env, chatId, `✅ Kategori "<b>${formatted}</b>" ditambahkan ke Keluarga & Pribadi.`, categoryManagementKeyboard());
   }
 
-  // ==== Free-text: AI intent detection + routing ====
+  // ==== Free-text: REGEX FIRST, AI FALLBACK ====
   try {
     const userRow = await env.DB.prepare('SELECT scope FROM users WHERE telegram_id = ?').bind(userId).first();
     const defaultScope = userRow?.scope || 'keluarga';
 
+    // STEP 1: Try regex parse (no AI cost)
+    const regexResult = regexParse(text);
+
+    if (regexResult && regexResult.amount) {
+      // Regex matched! Show category picker
+      const st = getState(userId);
+      st.pendingItem = regexResult.item;
+
+      const date = todayStr();
+      const kb = await regexCategoryPicker(env.DB, defaultScope, regexResult.item, regexResult.amount, date);
+      return sendMessageKb(env, chatId,
+        `📝 <b>${regexResult.item}</b> · ${rupiah(regexResult.amount)}\n\nPilih kategori:`, kb);
+    }
+
+    // STEP 2: AI fallback (only for complex input)
     const parsed = await aiParse(env, text, defaultScope);
 
     if (!parsed || !parsed.action) {
@@ -1005,7 +1307,7 @@ async function handleMessage(env, msg) {
       }
       const scope = parsed.scope || defaultScope;
       const type = parsed.type || 'expense';
-      const category = matchCategory(parsed.category, scope) || 'Lainnya';
+      const category = (await matchCategory(env.DB, parsed.category, scope)) || 'Lainnya';
       const date = parsed.date || todayStr();
 
       await handleCatat(env, userId, scope, type, parsed.amount, category, text, date, parsed.item || null);
