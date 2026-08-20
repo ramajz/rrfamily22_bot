@@ -166,25 +166,6 @@ async function deleteCategoryFromDb(db, scope, name) {
   return result.meta?.changes > 0;
 }
 
-// ============ D1 Draft Functions ============
-async function saveDraft(env, userId, data) {
-  await env.DB.prepare(
-    'INSERT OR REPLACE INTO pending_input (telegram_id, action, scope, category, data) VALUES (?, ?, ?, ?, ?)'
-  ).bind(userId, 'catat_draft', data.scope || 'keluarga', data.category || 'Lainnya', JSON.stringify(data)).run();
-}
-
-async function getDraft(env, userId) {
-  const row = await env.DB.prepare('SELECT * FROM pending_input WHERE telegram_id = ? AND action = ?')
-    .bind(userId, 'catat_draft').first();
-  if (!row) return null;
-  try { return { ...row, parsed: JSON.parse(row.data || '{}') }; } catch { return null; }
-}
-
-async function deleteDraft(env, userId) {
-  await env.DB.prepare('DELETE FROM pending_input WHERE telegram_id = ? AND action = ?')
-    .bind(userId, 'catat_draft').run();
-}
-
 function regexParse(text) {
   // Try to parse: "[item] [amount]"
   // Examples: "mie apong 50rb", "bensin 75rb", "listrik 350.000"
@@ -230,16 +211,19 @@ function regexParse(text) {
   return { item, amount };
 }
 
-async function regexCategoryPicker(db, scope) {
+async function regexCategoryPicker(db, scope, item, amount, date) {
   const cats = await getCategories(db, scope);
   const kb = { inline_keyboard: [] };
   let row = [];
   for (const c of cats) {
-    row.push({ text: c, callback_data: `draft_set_cat_${c}` });
+    row.push({ text: c, callback_data: `regex_cat_${scope}_${c}_${amount}_${date}` });
     if (row.length === 3) { kb.inline_keyboard.push(row); row = []; }
   }
   if (row.length) kb.inline_keyboard.push(row);
-  kb.inline_keyboard.push([{ text: '🔙 Kembali', callback_data: 'draft_back' }]);
+  kb.inline_keyboard.push([
+    { text: '📅 Kemarin', callback_data: `regex_date_${scope}_${amount}_kemarin` },
+    { text: '❌ Batal', callback_data: 'cancel_catat' },
+  ]);
   return kb;
 }
 
@@ -647,29 +631,6 @@ function deleteSearchResultKeyboard(transactions) {
   return kb;
 }
 
-function draftKeyboard(scope) {
-  const otherScope = scope === 'keluarga' ? 'pribadi' : 'keluarga';
-  const otherLabel = otherScope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi';
-  const scopeLabel = scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi';
-  return {
-    inline_keyboard: [
-      [{ text: '🏷️ Kategori', callback_data: 'draft_pick_cat' }],
-      [
-        { text: `🔄 ${scopeLabel}`, callback_data: `draft_switch_scope` },
-        { text: '📅 Kemarin', callback_data: 'draft_date_kemarin' },
-      ],
-      [
-        { text: '✅ Simpan', callback_data: 'draft_save' },
-        { text: '❌ Batal', callback_data: 'draft_cancel' },
-      ],
-    ],
-  };
-}
-
-function draftCategoryKeyboard(scope) {
-  return { inline_keyboard: [[{ text: '🔙 Kembali', callback_data: 'draft_back' }]] };
-}
-
 // ============ Screen Renderers ============
 async function showMainMenu(env, chatId) {
   const text =
@@ -945,11 +906,50 @@ async function handleCallback(env, cb) {
     return sendMessage(env, chatId, `✅ Kategori #${txId} diubah ke <b>${newCategory}</b>.`);
   }
 
-  // ---- Regex Catat: Save category to draft ----
+  // ---- Regex Catat: Save transaction from regex parse ----
   if (data.startsWith('regex_cat_')) {
-    // Legacy handler for old format - redirect to draft
-    await answerCallback(env, cb.id, 'OK');
-    return showMainMenu(env, chatId);
+    // Format: regex_cat_{scope}_{category}_{amount}_{date}
+    const rest = data.replace('regex_cat_', '');
+    // Split from the end: date is always YYYY-MM-DD (10 chars), amount is numeric
+    const dateMatch = rest.match(/_(\d{4}-\d{2}-\d{2})$/);
+    if (!dateMatch) {
+      await answerCallback(env, cb.id, 'Error');
+      return sendMessage(env, chatId, '❌ Format callback salah.');
+    }
+    const date = dateMatch[1];
+    const beforeDate = rest.slice(0, rest.lastIndexOf('_' + date));
+    // beforeDate = "scope_category_amount"
+    const lastUnderscore = beforeDate.lastIndexOf('_');
+    const amountStr = beforeDate.slice(lastUnderscore + 1);
+    const beforeAmount = beforeDate.slice(0, lastUnderscore);
+    const firstUnderscore = beforeAmount.indexOf('_');
+    const scope = beforeAmount.slice(0, firstUnderscore);
+    const category = beforeAmount.slice(firstUnderscore + 1);
+    const amount = parseInt(amountStr);
+
+    if (!amount || !category || !scope) {
+      await answerCallback(env, cb.id, 'Error');
+      return sendMessage(env, chatId, '❌ Data tidak lengkap.');
+    }
+
+    // Get pendingItem from state if available
+    const st = getState(userId);
+    const item = st.pendingItem || null;
+    st.pendingItem = null;
+
+    await handleCatat(env, userId, scope, 'expense', amount, category, `regex: ${item || category}`, date, item);
+
+    // Track undo
+    const newTx = await env.DB.prepare('SELECT id FROM transactions WHERE user_id = ? ORDER BY id DESC LIMIT 1').bind(userId).first();
+    if (newTx) st.lastUndoId = newTx.id;
+
+    const scopeLabel = scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi';
+    let reply = `✅ Dicatat!\n${scopeLabel} · ⬇️ ${category} · <b>${rupiah(amount)}</b>`;
+    const alert = await checkBudgetAlert(env, scope, amount);
+    if (alert) reply += '\n\n' + alert;
+
+    await answerCallback(env, cb.id, 'Tersimpan');
+    return sendMessageKb(env, chatId, reply, mainMenuKeyboard());
   }
 
   // ---- Hapus Start ----
@@ -1105,121 +1105,6 @@ async function handleCallback(env, cb) {
   if (data === 'export_csv') {
     await answerCallback(env, cb.id, 'Export...');
     return handleExport(env, chatId, userId, todayStr().slice(0, 7));
-  }
-
-  // ---- Draft: Save transaction ----
-  if (data === 'draft_save') {
-    const draft = await getDraft(env, userId);
-    if (!draft || !draft.parsed.amount) {
-      await answerCallback(env, cb.id, 'Error');
-      return sendMessageKb(env, chatId, '❌ Draft tidak ditemukan.', mainMenuKeyboard());
-    }
-    const d = draft.parsed;
-    await handleCatat(env, userId, d.scope, d.type || 'expense', d.amount, d.category, `regex: ${d.item || d.category}`, d.date, d.item || null);
-    await deleteDraft(env, userId);
-    const newTx = await env.DB.prepare('SELECT id FROM transactions WHERE user_id = ? ORDER BY id DESC LIMIT 1').bind(userId).first();
-    if (newTx) st.lastUndoId = newTx.id;
-    const scopeLabel = d.scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi';
-    const icon = d.type === 'income' ? '⬆️' : '⬇️';
-    let reply = `✅ Dicatat!\n${scopeLabel} · ${icon} ${d.category} · <b>${rupiah(d.amount)}</b>\n${d.item ? 'Item: ' + d.item + '\n' : ''}📅 ${d.date}`;
-    const alert = await checkBudgetAlert(env, d.scope, d.amount);
-    if (alert) reply += '\n\n' + alert;
-    await answerCallback(env, cb.id, 'Tersimpan');
-    return sendMessageKb(env, chatId, reply, postTransactionKeyboard(newTx?.id || 0));
-  }
-
-  // ---- Draft: Cancel ----
-  if (data === 'draft_cancel') {
-    await deleteDraft(env, userId);
-    await answerCallback(env, cb.id, 'Dibatalkan');
-    return sendMessageKb(env, chatId, '🗑️ Catatan dibatalkan.', mainMenuKeyboard());
-  }
-
-  // ---- Draft: Switch scope ----
-  if (data === 'draft_switch_scope') {
-    const draft = await getDraft(env, userId);
-    if (!draft) { await answerCallback(env, cb.id, 'Error'); return; }
-    const d = draft.parsed;
-    d.scope = d.scope === 'keluarga' ? 'pribadi' : 'keluarga';
-    await saveDraft(env, userId, d);
-    const scopeLabel = d.scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi';
-    await answerCallback(env, cb.id, `Dompet: ${scopeLabel}`);
-    let summary = `📝 <b>Draft Catatan</b>\n\n`;
-    summary += `Item: ${d.item || '-'}\n`;
-    summary += `Nominal: <b>${rupiah(d.amount)}</b>\n`;
-    summary += `Kategori: ${d.category}\n`;
-    summary += `Dompet: ${scopeLabel}\n`;
-    summary += `Tanggal: ${d.date}\n`;
-    summary += `\nPilih aksi:`;
-    return sendMessageKb(env, chatId, summary, draftKeyboard(d.scope));
-  }
-
-  // ---- Draft: Change date ----
-  if (data.startsWith('draft_date_')) {
-    const draft = await getDraft(env, userId);
-    if (!draft) { await answerCallback(env, cb.id, 'Error'); return; }
-    const d = draft.parsed;
-    const relativeDate = data.replace('draft_date_', '');
-    d.date = parseDate(relativeDate);
-    await saveDraft(env, userId, d);
-    const dateLabel = relativeDate === 'kemarin' ? 'Kemarin' : d.date;
-    await answerCallback(env, cb.id, `Tanggal: ${dateLabel}`);
-    const scopeLabel = d.scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi';
-    let summary = `📝 <b>Draft Catatan</b>\n\n`;
-    summary += `Item: ${d.item || '-'}\n`;
-    summary += `Nominal: <b>${rupiah(d.amount)}</b>\n`;
-    summary += `Kategori: ${d.category}\n`;
-    summary += `Dompet: ${scopeLabel}\n`;
-    summary += `Tanggal: ${d.date}\n`;
-    summary += `\nPilih aksi:`;
-    return sendMessageKb(env, chatId, summary, draftKeyboard(d.scope));
-  }
-
-  // ---- Draft: Back to summary ----
-  if (data === 'draft_back') {
-    const draft = await getDraft(env, userId);
-    if (!draft) { await answerCallback(env, cb.id, 'Error'); return sendMessageKb(env, chatId, '❌ Draft tidak ditemukan.', mainMenuKeyboard()); }
-    const d = draft.parsed;
-    const scopeLabel = d.scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi';
-    let summary = `📝 <b>Draft Catatan</b>\n\n`;
-    summary += `Item: ${d.item || '-'}\n`;
-    summary += `Nominal: <b>${rupiah(d.amount)}</b>\n`;
-    summary += `Kategori: ${d.category}\n`;
-    summary += `Dompet: ${scopeLabel}\n`;
-    summary += `Tanggal: ${d.date}\n`;
-    summary += `\nPilih aksi:`;
-    await answerCallback(env, cb.id, 'Draft');
-    return sendMessageKb(env, chatId, summary, draftKeyboard(d.scope));
-  }
-
-  // ---- Draft: Pick category ----
-  if (data === 'draft_pick_cat') {
-    const draft = await getDraft(env, userId);
-    if (!draft) { await answerCallback(env, cb.id, 'Error'); return; }
-    const d = draft.parsed;
-    const kb = await regexCategoryPicker(env.DB, d.scope);
-    await answerCallback(env, cb.id, 'Pilih kategori');
-    return sendMessageKb(env, chatId, `🏷️ Pilih kategori untuk <b>${d.item || 'transaksi'}</b>:`, kb);
-  }
-
-  // ---- Draft: Set category ----
-  if (data.startsWith('draft_set_cat_')) {
-    const draft = await getDraft(env, userId);
-    if (!draft) { await answerCallback(env, cb.id, 'Error'); return; }
-    const d = draft.parsed;
-    const newCat = data.replace('draft_set_cat_', '');
-    d.category = newCat;
-    await saveDraft(env, userId, d);
-    const scopeLabel = d.scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi';
-    let summary = `📝 <b>Draft Catatan</b>\n\n`;
-    summary += `Item: ${d.item || '-'}\n`;
-    summary += `Nominal: <b>${rupiah(d.amount)}</b>\n`;
-    summary += `Kategori: ${d.category}\n`;
-    summary += `Dompet: ${scopeLabel}\n`;
-    summary += `Tanggal: ${d.date}\n`;
-    summary += `\nPilih aksi:`;
-    await answerCallback(env, cb.id, `Kategori: ${newCat}`);
-    return sendMessageKb(env, chatId, summary, draftKeyboard(d.scope));
   }
 
   // Fallback
@@ -1475,25 +1360,14 @@ async function handleMessage(env, msg) {
     const regexResult = regexParse(text);
 
     if (regexResult && regexResult.amount) {
-      // Save draft to D1 and show summary
-      const draft = {
-        item: regexResult.item,
-        amount: regexResult.amount,
-        scope: defaultScope,
-        category: 'Lainnya',
-        date: todayStr(),
-        type: 'expense',
-      };
-      await saveDraft(env, userId, draft);
-      const scopeLabel = draft.scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi';
-      let summary = `📝 <b>Draft Catatan</b>\n\n`;
-      summary += `Item: ${regexResult.item}\n`;
-      summary += `Nominal: <b>${rupiah(regexResult.amount)}</b>\n`;
-      summary += `Kategori: Lainnya\n`;
-      summary += `Dompet: ${scopeLabel}\n`;
-      summary += `Tanggal: ${draft.date}\n`;
-      summary += `\nPilih aksi:`;
-      return sendMessageKb(env, chatId, summary, draftKeyboard(draft.scope));
+      // Regex matched! Show category picker
+      const st = getState(userId);
+      st.pendingItem = regexResult.item;
+
+      const date = todayStr();
+      const kb = await regexCategoryPicker(env.DB, defaultScope, regexResult.item, regexResult.amount, date);
+      return sendMessageKb(env, chatId,
+        `📝 <b>${regexResult.item}</b> · ${rupiah(regexResult.amount)}\n\nPilih kategori:`, kb);
     }
 
     // STEP 2: AI fallback (only for complex input)
@@ -1515,26 +1389,23 @@ async function handleMessage(env, msg) {
       const category = (await matchCategory(env.DB, parsed.category, scope)) || 'Lainnya';
       const date = parsed.date || todayStr();
 
-      // Save draft, not direct save
-      const draft = {
-        item: parsed.item || null,
-        amount: parsed.amount,
-        scope,
-        category,
-        date,
-        type,
-      };
-      await saveDraft(env, userId, draft);
-      const scopeLabel = scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi';
+      await handleCatat(env, userId, scope, type, parsed.amount, category, text, date, parsed.item || null);
+
+      // Track undo window
+      const newTx = await env.DB.prepare('SELECT id FROM transactions WHERE user_id = ? ORDER BY id DESC LIMIT 1').bind(userId).first();
+      if (newTx) st.lastUndoId = newTx.id;
+
       const icon = type === 'income' ? '⬆️' : '⬇️';
-      let summary = `📝 <b>Draft Catatan</b>\n\n`;
-      summary += `Item: ${parsed.item || '-'}\n`;
-      summary += `Nominal: <b>${rupiah(parsed.amount)}</b>\n`;
-      summary += `Kategori: ${category}\n`;
-      summary += `Dompet: ${scopeLabel} ${icon}\n`;
-      summary += `Tanggal: ${date}\n`;
-      summary += `\nPilih aksi:`;
-      return sendMessageKb(env, chatId, summary, draftKeyboard(scope));
+      let reply = `✅ Dicatat ${name}!\n` +
+        `${scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi'} · ${icon} ${category} · <b>${rupiah(parsed.amount)}</b>\n` +
+        `<code>${date}</code>`;
+
+      if (type === 'expense') {
+        const alert = await checkBudgetAlert(env, scope, parsed.amount);
+        if (alert) reply += '\n\n' + alert;
+      }
+
+      return sendMessageKb(env, chatId, reply, postTransactionKeyboard(newTx?.id || 0));
     }
 
     // ---- Action: riwayat ----
