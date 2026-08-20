@@ -26,7 +26,7 @@ const userState = {};
 
 function getState(userId) {
   if (!userState[userId]) {
-    userState[userId] = { lastUndoId: null, awaitingDeleteSearch: false, awaitingBudgetScope: null, awaitingCategoryName: false, awaitingEditNominal: null, awaitingCategoryRename: null };
+    userState[userId] = { lastUndoId: null, awaitingDeleteSearch: false, awaitingBudgetScope: null, awaitingCategoryName: false, awaitingEditNominal: null, awaitingCategoryRename: null, awaitingDraftDate: false, awaitingDraftItem: null, awaitingEditItem: null, awaitingEditDate: null };
   }
   return userState[userId];
 }
@@ -655,8 +655,11 @@ function draftKeyboard(scope) {
     inline_keyboard: [
       [{ text: '🏷️ Kategori', callback_data: 'draft_pick_cat' }],
       [
-        { text: `🔄 ${scopeLabel}`, callback_data: `draft_switch_scope` },
+        { text: `🔄 ${scopeLabel}`, callback_data: 'draft_switch_scope' },
+      ],
+      [
         { text: '📅 Kemarin', callback_data: 'draft_date_kemarin' },
+        { text: '📅 Tanggal Lain', callback_data: 'draft_date_custom' },
       ],
       [
         { text: '✅ Simpan', callback_data: 'draft_save' },
@@ -803,6 +806,10 @@ async function handleCallback(env, cb) {
   st.awaitingCategoryName = false;
   st.awaitingEditNominal = null;
   st.awaitingCategoryRename = null;
+  st.awaitingDraftDate = false;
+  st.awaitingDraftItem = null;
+  st.awaitingEditItem = null;
+  st.awaitingEditDate = null;
 
   // ---- TX Detail (edit/hapus dari riwayat) ----
   if (data.startsWith('tx_detail_')) {
@@ -816,6 +823,8 @@ async function handleCallback(env, cb) {
       inline_keyboard: [
         [{ text: '✏️ Edit Kategori', callback_data: `ubah_kategori_${tx.id}` }],
         [{ text: '✏️ Edit Nominal', callback_data: `edit_nominal_${tx.id}` }],
+        [{ text: '✏️ Edit Item', callback_data: `edit_item_${tx.id}` }],
+        [{ text: '📅 Edit Tanggal', callback_data: `edit_tanggal_${tx.id}` }],
         [{ text: '🗑️ Hapus', callback_data: `hapus_tx_${tx.id}` }],
         [{ text: '🔙 Kembali', callback_data: 'riwayat_1' }]
       ]
@@ -827,6 +836,20 @@ async function handleCallback(env, cb) {
     const txId = parseInt(data.replace('edit_nominal_', ''));
     st.awaitingEditNominal = txId;
     return sendMessage(env, chatId, `💰 Ketik nominal baru untuk #${txId}:\nContoh: <code>35rb</code> atau <code>75000</code>`);
+  }
+
+  // ---- Edit Item ----
+  if (data.startsWith('edit_item_')) {
+    const txId = parseInt(data.replace('edit_item_', ''));
+    st.awaitingEditItem = txId;
+    return sendMessage(env, chatId, `📝 Ketik nama item baru untuk #${txId}:`);
+  }
+
+  // ---- Edit Tanggal ----
+  if (data.startsWith('edit_tanggal_')) {
+    const txId = parseInt(data.replace('edit_tanggal_', ''));
+    st.awaitingEditDate = txId;
+    return sendMessage(env, chatId, `📅 Ketik tanggal baru untuk #${txId}:\nFormat: <code>DD/MM</code> atau <code>YYYY-MM-DD</code>\nContoh: <code>15/08</code>`);
   }
 
   // ---- Hapus dari riwayat ----
@@ -1155,7 +1178,7 @@ async function handleCallback(env, cb) {
   }
 
   // ---- Draft: Change date ----
-  if (data.startsWith('draft_date_')) {
+  if (data.startsWith('draft_date_') && data !== 'draft_date_custom') {
     const draft = await getDraft(env, userId);
     if (!draft) { await answerCallback(env, cb.id, 'Error'); return; }
     const d = draft.parsed;
@@ -1173,6 +1196,13 @@ async function handleCallback(env, cb) {
     summary += `Tanggal: ${d.date}\n`;
     summary += `\nPilih aksi:`;
     return sendMessageKb(env, chatId, summary, draftKeyboard(d.scope));
+  }
+
+  // ---- Draft: Custom date prompt ----
+  if (data === 'draft_date_custom') {
+    st.awaitingDraftDate = true;
+    await answerCallback(env, cb.id, 'Tanggal custom');
+    return sendMessage(env, chatId, `📅 Ketik tanggal transaksi:\nFormat: <code>DD/MM</code> atau <code>YYYY-MM-DD</code>\nContoh: <code>15/08</code> atau <code>2026-08-15</code>`);
   }
 
   // ---- Draft: Back to summary ----
@@ -1464,6 +1494,47 @@ async function handleMessage(env, msg) {
       await addCategoryToDb(env.DB, sc, formatted);
     }
     return sendMessageKb(env, chatId, `✅ Kategori "<b>${formatted}</b>" ditambahkan ke Keluarga & Pribadi.`, categoryManagementKeyboard());
+  }
+
+  // Awaiting: Draft custom date
+  if (st.awaitingDraftDate) {
+    st.awaitingDraftDate = false;
+    const draft = await getDraft(env, userId);
+    if (!draft) return sendMessageKb(env, chatId, '❌ Draft tidak ditemukan.', mainMenuKeyboard());
+    const d = draft.parsed;
+    d.date = parseDate(text.trim());
+    await saveDraft(env, userId, d);
+    const scopeLabel = d.scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi';
+    let summary = `📝 <b>Draft Catatan</b>\n\n`;
+    summary += `Item: ${d.item || '-'}\n`;
+    summary += `Nominal: <b>${rupiah(d.amount)}</b>\n`;
+    summary += `Kategori: ${d.category}\n`;
+    summary += `Dompet: ${scopeLabel}\n`;
+    summary += `Tanggal: ${d.date}\n`;
+    summary += `\nPilih aksi:`;
+    return sendMessageKb(env, chatId, summary, draftKeyboard(d.scope));
+  }
+
+  // Awaiting: Edit item for existing transaction
+  if (st.awaitingEditItem) {
+    const txId = st.awaitingEditItem;
+    st.awaitingEditItem = null;
+    const newItem = text.trim();
+    if (!newItem || newItem.length < 2) {
+      return sendMessage(env, chatId, '⚠️ Nama item terlalu pendek.');
+    }
+    const formatted = newItem.charAt(0).toUpperCase() + newItem.slice(1).toLowerCase();
+    await env.DB.prepare('UPDATE transactions SET item = ? WHERE id = ? AND user_id = ?').bind(formatted, txId, userId).run();
+    return sendMessageKb(env, chatId, `✅ Item #${txId} diupdate ke "<b>${formatted}</b>"`, mainMenuKeyboard());
+  }
+
+  // Awaiting: Edit date for existing transaction
+  if (st.awaitingEditDate) {
+    const txId = st.awaitingEditDate;
+    st.awaitingEditDate = null;
+    const newDate = parseDate(text.trim());
+    await env.DB.prepare('UPDATE transactions SET tx_date = ? WHERE id = ? AND user_id = ?').bind(newDate, txId, userId).run();
+    return sendMessageKb(env, chatId, `✅ Tanggal #${txId} diupdate ke <b>${newDate}</b>`, mainMenuKeyboard());
   }
 
   // ==== Free-text: REGEX FIRST, AI FALLBACK ====
