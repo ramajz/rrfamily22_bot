@@ -131,19 +131,26 @@ async function seedCategories(db) {
   }
 }
 
-async function getCategories(db, scope) {
-  const rows = await db.prepare(
-    'SELECT name FROM categories WHERE scope = ? AND type = ? ORDER BY id'
-  ).bind(scope, 'expense').all();
-  if (rows.results.length === 0) {
+async function getCategories(db, scope, typeFilter = 'expense') {
+  let query = 'SELECT name FROM categories WHERE scope = ?';
+  const params = [scope];
+  if (typeFilter) {
+    query += ' AND type = ?';
+    params.push(typeFilter);
+  }
+  query += ' ORDER BY id';
+  const rows = await db.prepare(query).bind(...params).all();
+  if (rows.results.length === 0 && typeFilter === 'expense') {
     // Empty → seed defaults first, then re-read
     await seedCategories(db);
-    const retry = await db.prepare(
-      'SELECT name FROM categories WHERE scope = ? AND type = ? ORDER BY id'
-    ).bind(scope, 'expense').all();
+    const retry = await db.prepare(query).bind(...params).all();
     return retry.results.map(r => r.name);
   }
   return rows.results.map(r => r.name);
+}
+
+async function getIncomeCategories(db, scope) {
+  return getCategories(db, scope, 'income');
 }
 
 async function addCategoryToDb(db, scope, name) {
@@ -224,17 +231,38 @@ function regexParse(text) {
 
   if (!item || item.length < 2) return null;
 
+  // Income keywords map the transaction to income categories.
+  const incomeMatch = /^(gaji|pendapatan|income|pemasukan|masuk|terima|honor|bonus|fee)\b/i.test(item);
+  const type = incomeMatch ? 'income' : 'expense';
+  if (incomeMatch) {
+    item = item.replace(/^(gaji|pendapatan|income|pemasukan|masuk|terima|honor|bonus|fee)\s*/i, '').trim() || 'Pendapatan';
+  }
+
   // Capitalize first letter
   item = item.charAt(0).toUpperCase() + item.slice(1);
 
-  return { item, amount };
+  return { item, amount, type };
 }
 
 async function regexCategoryPicker(db, scope) {
-  const cats = await getCategories(db, scope);
+  const expenseCats = await getCategories(db, scope, 'expense');
+  const incomeCats = await getCategories(db, scope, 'income');
   const kb = { inline_keyboard: [] };
   let row = [];
-  for (const c of cats) {
+
+  // Income categories first
+  for (const c of incomeCats) {
+    row.push({ text: `⬆️ ${c}`, callback_data: `draft_set_cat_${c}` });
+    if (row.length === 3) { kb.inline_keyboard.push(row); row = []; }
+  }
+  if (row.length) kb.inline_keyboard.push(row);
+
+  // Separator
+  kb.inline_keyboard.push([{ text: '— Pengeluaran —', callback_data: 'noop' }]);
+
+  // Expense categories
+  row = [];
+  for (const c of expenseCats) {
     row.push({ text: c, callback_data: `draft_set_cat_${c}` });
     if (row.length === 3) { kb.inline_keyboard.push(row); row = []; }
   }
@@ -560,8 +588,8 @@ function settingsKeyboard(scope) {
   };
 }
 
-async function categoryPickerKeyboard(db, txId, scope) {
-  const cats = await getCategories(db, scope);
+async function categoryPickerKeyboard(db, txId, scope, type = 'expense') {
+  const cats = type === 'income' ? await getIncomeCategories(db, scope) : await getCategories(db, scope, 'expense');
   const kb = { inline_keyboard: [] };
   let row = [];
   for (const c of cats) {
@@ -647,16 +675,14 @@ function deleteSearchResultKeyboard(transactions) {
   return kb;
 }
 
-function draftKeyboard(scope) {
-  const otherScope = scope === 'keluarga' ? 'pribadi' : 'keluarga';
-  const otherLabel = otherScope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi';
+function draftKeyboard(scope, type = 'expense') {
   const scopeLabel = scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi';
+  const typeLabel = type === 'income' ? '⬆️ Pendapatan' : '⬇️ Pengeluaran';
   return {
     inline_keyboard: [
+      [{ text: `Jenis: ${typeLabel}`, callback_data: 'draft_switch_type' }],
       [{ text: '🏷️ Kategori', callback_data: 'draft_pick_cat' }],
-      [
-        { text: `🔄 ${scopeLabel}`, callback_data: 'draft_switch_scope' },
-      ],
+      [{ text: `🔄 ${scopeLabel}`, callback_data: 'draft_switch_scope' }],
       [
         { text: '📅 Kemarin', callback_data: 'draft_date_kemarin' },
         { text: '📅 Tanggal Lain', callback_data: 'draft_date_custom' },
@@ -1158,6 +1184,26 @@ async function handleCallback(env, cb) {
     return sendMessageKb(env, chatId, '🗑️ Catatan dibatalkan.', mainMenuKeyboard());
   }
 
+  // ---- Draft: Switch type (income/expense) ----
+  if (data === 'draft_switch_type') {
+    const draft = await getDraft(env, userId);
+    if (!draft) { await answerCallback(env, cb.id, 'Error'); return; }
+    const d = draft.parsed;
+    d.type = d.type === 'income' ? 'expense' : 'income';
+    d.category = d.type === 'income' ? 'Gaji' : 'Lainnya';
+    await saveDraft(env, userId, d);
+    const typeLabel = d.type === 'income' ? '⬆️ Pendapatan' : '⬇️ Pengeluaran';
+    await answerCallback(env, cb.id, `Jenis: ${typeLabel}`);
+    let summary = `📝 <b>Draft Catatan</b>\n\n`;
+    summary += `Jenis: ${typeLabel}\n`;
+    summary += `Item: ${d.item || '-'}\n`;
+    summary += `Nominal: <b>${rupiah(d.amount)}</b>\n`;
+    summary += `Kategori: ${d.category}\n`;
+    summary += `Dompet: ${d.scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi'}\n`;
+    summary += `Tanggal: ${d.date}\n\nPilih aksi:`;
+    return sendMessageKb(env, chatId, summary, draftKeyboard(d.scope, d.type));
+  }
+
   // ---- Draft: Switch scope ----
   if (data === 'draft_switch_scope') {
     const draft = await getDraft(env, userId);
@@ -1174,7 +1220,7 @@ async function handleCallback(env, cb) {
     summary += `Dompet: ${scopeLabel}\n`;
     summary += `Tanggal: ${d.date}\n`;
     summary += `\nPilih aksi:`;
-    return sendMessageKb(env, chatId, summary, draftKeyboard(d.scope));
+    return sendMessageKb(env, chatId, summary, draftKeyboard(d.scope, d.type));
   }
 
   // ---- Draft: Change date ----
@@ -1195,7 +1241,7 @@ async function handleCallback(env, cb) {
     summary += `Dompet: ${scopeLabel}\n`;
     summary += `Tanggal: ${d.date}\n`;
     summary += `\nPilih aksi:`;
-    return sendMessageKb(env, chatId, summary, draftKeyboard(d.scope));
+    return sendMessageKb(env, chatId, summary, draftKeyboard(d.scope, d.type));
   }
 
   // ---- Draft: Custom date prompt ----
@@ -1219,7 +1265,7 @@ async function handleCallback(env, cb) {
     summary += `Tanggal: ${d.date}\n`;
     summary += `\nPilih aksi:`;
     await answerCallback(env, cb.id, 'Draft');
-    return sendMessageKb(env, chatId, summary, draftKeyboard(d.scope));
+    return sendMessageKb(env, chatId, summary, draftKeyboard(d.scope, d.type));
   }
 
   // ---- Draft: Pick category ----
@@ -1249,7 +1295,7 @@ async function handleCallback(env, cb) {
     summary += `Tanggal: ${d.date}\n`;
     summary += `\nPilih aksi:`;
     await answerCallback(env, cb.id, `Kategori: ${newCat}`);
-    return sendMessageKb(env, chatId, summary, draftKeyboard(d.scope));
+    return sendMessageKb(env, chatId, summary, draftKeyboard(d.scope, d.type));
   }
 
   // Fallback
@@ -1512,7 +1558,7 @@ async function handleMessage(env, msg) {
     summary += `Dompet: ${scopeLabel}\n`;
     summary += `Tanggal: ${d.date}\n`;
     summary += `\nPilih aksi:`;
-    return sendMessageKb(env, chatId, summary, draftKeyboard(d.scope));
+    return sendMessageKb(env, chatId, summary, draftKeyboard(d.scope, d.type));
   }
 
   // Awaiting: Edit item for existing transaction
@@ -1553,11 +1599,13 @@ async function handleMessage(env, msg) {
         scope: defaultScope,
         category: 'Lainnya',
         date: todayStr(),
-        type: 'expense',
+        type: regexResult.type || 'expense',
       };
       await saveDraft(env, userId, draft);
       const scopeLabel = draft.scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi';
+      const typeLabel = draft.type === 'income' ? '⬆️ Pendapatan' : '⬇️ Pengeluaran';
       let summary = `📝 <b>Draft Catatan</b>\n\n`;
+      summary += `Jenis: ${typeLabel}\n`;
       summary += `Item: ${regexResult.item}\n`;
       summary += `Nominal: <b>${rupiah(regexResult.amount)}</b>\n`;
       summary += `Kategori: Lainnya\n`;
