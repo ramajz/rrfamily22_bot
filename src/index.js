@@ -11,7 +11,7 @@ const WHITELIST = {
 
 const DEFAULT_CATEGORIES = {
   keluarga: ['Makan', 'Transport', 'Kebutuhan', 'Cicilan', 'Pendidikan', 'Kesehatan', 'Hiburan', 'Lainnya'],
-  pribadi: ['Jajan', 'Transport', 'Invest', 'Project', 'Lainnya'],
+  pribadi: ['Jajan', 'Transport', 'Invest', 'Project', 'Rutin', 'Lainnya'],
 };
 const INCOME_CATEGORIES = ['Gaji', 'Side Income'];
 
@@ -26,7 +26,7 @@ const userState = {};
 
 function getState(userId) {
   if (!userState[userId]) {
-    userState[userId] = { lastUndoId: null, awaitingDeleteSearch: false, awaitingBudgetScope: null, awaitingCategoryName: false, awaitingEditNominal: null, awaitingCategoryRename: null, awaitingDraftDate: false, awaitingDraftItem: null, awaitingEditItem: null, awaitingEditDate: null };
+    userState[userId] = { lastUndoId: null, awaitingDeleteSearch: false, awaitingBudgetScope: null, awaitingCategoryName: false, awaitingEditNominal: null, awaitingCategoryRename: null, awaitingDraftDate: false, awaitingDraftAmount: false, awaitingDraftNote: false, awaitingDraftItem: null, awaitingEditItem: null, awaitingEditDate: null };
   }
   return userState[userId];
 }
@@ -153,23 +153,23 @@ async function getIncomeCategories(db, scope) {
   return getCategories(db, scope, 'income');
 }
 
-async function addCategoryToDb(db, scope, name) {
+async function addCategoryToDb(db, scope, name, type = 'expense') {
   await db.prepare(
     'INSERT OR IGNORE INTO categories (scope, name, type, is_default) VALUES (?, ?, ?, 0)'
-  ).bind(scope, name, 'expense').run();
+  ).bind(scope, name, type).run();
 }
 
-async function renameCategoryInDb(db, scope, oldName, newName) {
+async function renameCategoryInDb(db, scope, oldName, newName, type = 'expense') {
   const result = await db.prepare(
     'UPDATE categories SET name = ? WHERE scope = ? AND name = ? AND type = ?'
-  ).bind(newName, scope, oldName, 'expense').run();
+  ).bind(newName, scope, oldName, type).run();
   return result.meta?.changes > 0;
 }
 
-async function deleteCategoryFromDb(db, scope, name) {
+async function deleteCategoryFromDb(db, scope, name, type = 'expense') {
   const result = await db.prepare(
     'DELETE FROM categories WHERE scope = ? AND name = ? AND type = ? AND is_default = 0'
-  ).bind(scope, name, 'expense').run();
+  ).bind(scope, name, type).run();
   return result.meta?.changes > 0;
 }
 
@@ -241,33 +241,40 @@ function regexParse(text) {
   // Capitalize first letter
   item = item.charAt(0).toUpperCase() + item.slice(1);
 
-  return { item, amount, type };
+  // `item` is retained only for backward compatibility; UI concept is `note`.
+  return { note: item, item, amount, type };
 }
 
-async function regexCategoryPicker(db, scope) {
+async function regexCategoryPicker(db, scope, typeFilter = null) {
   const expenseCats = await getCategories(db, scope, 'expense');
   const incomeCats = await getCategories(db, scope, 'income');
   const kb = { inline_keyboard: [] };
   let row = [];
 
   // Income categories first
-  for (const c of incomeCats) {
-    row.push({ text: `⬆️ ${c}`, callback_data: `draft_set_cat_${c}` });
-    if (row.length === 3) { kb.inline_keyboard.push(row); row = []; }
+  if (typeFilter !== 'expense') {
+    for (const c of incomeCats) {
+      row.push({ text: `⬆️ ${c}`, callback_data: `draft_set_cat_${c}` });
+      if (row.length === 3) { kb.inline_keyboard.push(row); row = []; }
+    }
+    if (row.length) kb.inline_keyboard.push(row);
   }
-  if (row.length) kb.inline_keyboard.push(row);
 
   // Separator
-  kb.inline_keyboard.push([{ text: '— Pengeluaran —', callback_data: 'noop' }]);
+  if (typeFilter !== 'income') {
+    kb.inline_keyboard.push([{ text: '— Pengeluaran —', callback_data: 'noop' }]);
+  }
 
   // Expense categories
-  row = [];
-  for (const c of expenseCats) {
-    row.push({ text: c, callback_data: `draft_set_cat_${c}` });
-    if (row.length === 3) { kb.inline_keyboard.push(row); row = []; }
+  if (typeFilter !== 'income') {
+    row = [];
+    for (const c of expenseCats) {
+      row.push({ text: c, callback_data: `draft_set_cat_${c}` });
+      if (row.length === 3) { kb.inline_keyboard.push(row); row = []; }
+    }
+    if (row.length) kb.inline_keyboard.push(row);
   }
-  if (row.length) kb.inline_keyboard.push(row);
-  kb.inline_keyboard.push([{ text: '🔙 Kembali', callback_data: 'draft_back' }]);
+  kb.inline_keyboard.push([{ text: '🔙 Kembali', callback_data: 'draft_cancel' }]);
   return kb;
 }
 
@@ -311,6 +318,14 @@ async function matchCategory(db, word, scope) {
   const cats = [...(await getCategories(db, scope)), ...INCOME_CATEGORIES];
   const found = cats.find(c => c.toLowerCase() === w || c.toLowerCase().startsWith(w) || w.startsWith(c.toLowerCase()));
   return found || null;
+}
+
+async function explicitCategoryFromText(db, text, scope) {
+  const lower = String(text || '').toLowerCase();
+  const cats = await getCategories(db, scope);
+  return cats
+    .sort((a, b) => b.length - a.length)
+    .find(c => new RegExp(`kategori(?:nya)?\\s*(?:adalah|:)??\\s*${c.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&').toLowerCase()}\\b`, 'i').test(lower)) || null;
 }
 
 function daysInMonth() {
@@ -378,7 +393,7 @@ async function aiParse(env, text, defaultScope) {
   "type": "income|expense",
   "amount": <int rupiah>,
   "category": "<nama kategori>",
-  "item": "<nama produk/merk, atau null>",
+  "note": "<catatan/deskripsi transaksi, atau null>",
   "date": "YYYY-MM-DD|null",
   "original_text": "<teks asli user>"
 }
@@ -398,7 +413,7 @@ Aturan untuk action=catat:
 - scope: null jika tidak jelas (default "${defaultScope}").
 - "gaji", "masuk", "terima" = income. Sisanya expense.
 - category: cocokkan ke daftar: ${catList}. Jika gak cocok → "Lainnya".
-- item: NAMA PRODUK/MERK jika disebut. "pampers sweety 55rb" → item="pampers sweety". "makan 25rb" → null.
+- note: CATATAN/DESKRIPSI transaksi jika disebut. "pampers sweety 55rb" → note="Pampers Sweety". "makan 25rb" → null.
 - date: "kemarin" = tanggal kemarin. null = hari ini.
 
 KATEGORI YANG TERSEDIA:
@@ -554,6 +569,7 @@ async function searchTransactions(env, userId, query) {
 function mainMenuKeyboard() {
   return {
     inline_keyboard: [
+      [{ text: '⬆️ Pemasukan', callback_data: 'income_start' }, { text: '💸 Pengeluaran', callback_data: 'expense_start' }],
       [{ text: '📊 Riwayat', callback_data: 'riwayat_1' }, { text: '💰 Sisa Budget', callback_data: 'sisa' }],
       [{ text: '⚙️ Settings', callback_data: 'settings' }],
     ],
@@ -629,10 +645,30 @@ function budgetMenuKeyboard() {
 function categoryManagementKeyboard() {
   return {
     inline_keyboard: [
+      [{ text: '💸 Kategori Pengeluaran', callback_data: 'kategori_expense_menu' }],
+      [{ text: '⬆️ Kategori Pemasukan', callback_data: 'kategori_income_menu' }],
+      [{ text: '⬅️ Kembali', callback_data: 'settings' }],
+    ],
+  };
+}
+
+function categoryTypeKeyboard(type) {
+  if (type === 'income') {
+    return {
+      inline_keyboard: [
+        [{ text: '➕ Tambah Kategori', callback_data: 'kategori_income_add' }],
+        [{ text: '✏️ Edit/Rename', callback_data: 'kategori_income_edit_list' }],
+        [{ text: '🗑️ Hapus Kategori', callback_data: 'kategori_income_hapus_list' }],
+        [{ text: '⬅️ Kembali', callback_data: 'kategori' }],
+      ],
+    };
+  }
+  return {
+    inline_keyboard: [
       [{ text: '➕ Tambah Kategori', callback_data: 'kategori_add' }],
       [{ text: '✏️ Edit/Rename', callback_data: 'kategori_edit_list' }],
       [{ text: '🗑️ Hapus Kategori', callback_data: 'kategori_hapus_list' }],
-      [{ text: '⬅️ Kembali', callback_data: 'settings' }],
+      [{ text: '⬅️ Kembali', callback_data: 'kategori' }],
     ],
   };
 }
@@ -668,7 +704,7 @@ function deleteSearchResultKeyboard(transactions) {
   for (const tx of transactions) {
     const icon = tx.type === 'income' ? '⬆️' : '⬇️';
     const sc = tx.scope === 'keluarga' ? '🏠' : '🙋';
-    const label = `${sc} ${icon} #${tx.id} ${tx.item || tx.category} ${rupiah(tx.amount)} · ${tx.tx_date}`.slice(0, 60);
+    const label = `${sc} ${icon} #${tx.id} ${tx.note || tx.item || tx.category} ${rupiah(tx.amount)} · ${tx.tx_date}`.slice(0, 60);
     kb.inline_keyboard.push([{ text: label, callback_data: `hapus_yes_${tx.id}` }]);
   }
   kb.inline_keyboard.push([{ text: '❌ Batal', callback_data: 'settings' }]);
@@ -683,6 +719,7 @@ function draftKeyboard(scope, type = 'expense') {
       [{ text: `Jenis: ${typeLabel}`, callback_data: 'draft_switch_type' }],
       [{ text: '🏷️ Kategori', callback_data: 'draft_pick_cat' }],
       [{ text: `🔄 ${scopeLabel}`, callback_data: 'draft_switch_scope' }],
+      [{ text: '📝 Catatan', callback_data: 'draft_note' }],
       [
         { text: '📅 Kemarin', callback_data: 'draft_date_kemarin' },
         { text: '📅 Tanggal Lain', callback_data: 'draft_date_custom' },
@@ -759,7 +796,7 @@ async function showRiwayat(env, chatId, userId, page = 1) {
   for (const r of rows.results || []) {
     const icon = r.type === 'income' ? '⬆️' : '⬇️';
     const sc = r.scope === 'keluarga' ? '🏠' : '🙋';
-    const label = `${sc} ${icon} ${r.item || r.category} ${rupiah(r.amount)}`;
+    const label = `${sc} ${icon} ${r.note || r.item || r.category} ${rupiah(r.amount)}`;
     txButtons.push([{ text: label, callback_data: `tx_detail_${r.id}` }]);
   }
 
@@ -803,10 +840,11 @@ async function showCategoryManagement(env, chatId) {
   let out = '🏷️ <b>Kategori</b>\n\n';
   for (const sc of ['keluarga', 'pribadi']) {
     const label = sc === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi';
-    const cats = await getCategories(env.DB, sc);
-    out += `<b>${label}</b>: ${cats.join(', ')}\n`;
+    const expenseCats = await getCategories(env.DB, sc, 'expense');
+    const incomeCats = await getCategories(env.DB, sc, 'income');
+    out += `<b>${label}</b>\n💸 Pengeluaran: ${expenseCats.join(', ')}\n⬆️ Pemasukan: ${incomeCats.join(', ')}\n\n`;
   }
-  return sendMessageKb(env, chatId, out, categoryManagementKeyboard());
+  return sendMessageKb(env, chatId, out.trim(), categoryManagementKeyboard());
 }
 
 async function showDeleteSearchPrompt(env, chatId) {
@@ -833,6 +871,8 @@ async function handleCallback(env, cb) {
   st.awaitingEditNominal = null;
   st.awaitingCategoryRename = null;
   st.awaitingDraftDate = false;
+  st.awaitingDraftAmount = false;
+  st.awaitingDraftNote = false;
   st.awaitingDraftItem = null;
   st.awaitingEditItem = null;
   st.awaitingEditDate = null;
@@ -844,12 +884,12 @@ async function handleCallback(env, cb) {
     if (!tx) return sendMessage(env, chatId, '❌ Transaksi gak ditemukan.');
     const icon = tx.type === 'income' ? '⬆️' : '⬇️';
     const sc = tx.scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi';
-    const detail = `📋 <b>Transaksi #${tx.id}</b>\n\n${sc} · ${icon} ${tx.category}\nItem: ${tx.item || '-'}\nNominal: <b>${rupiah(tx.amount)}</b>\nTanggal: ${tx.tx_date}\nNote: ${tx.note || '-'}`;
+    const detail = `📋 <b>Transaksi #${tx.id}</b>\n\n${sc} · ${icon} ${tx.category}\nCatatan: ${tx.note || tx.item || '-'}\nNominal: <b>${rupiah(tx.amount)}</b>\nTanggal: ${tx.tx_date}`;
     return sendMessageKb(env, chatId, detail, {
       inline_keyboard: [
         [{ text: '✏️ Edit Kategori', callback_data: `ubah_kategori_${tx.id}` }],
         [{ text: '✏️ Edit Nominal', callback_data: `edit_nominal_${tx.id}` }],
-        [{ text: '✏️ Edit Item', callback_data: `edit_item_${tx.id}` }],
+        [{ text: '✏️ Edit Catatan', callback_data: `edit_item_${tx.id}` }],
         [{ text: '📅 Edit Tanggal', callback_data: `edit_tanggal_${tx.id}` }],
         [{ text: '🗑️ Hapus', callback_data: `hapus_tx_${tx.id}` }],
         [{ text: '🔙 Kembali', callback_data: 'riwayat_1' }]
@@ -864,11 +904,11 @@ async function handleCallback(env, cb) {
     return sendMessage(env, chatId, `💰 Ketik nominal baru untuk #${txId}:\nContoh: <code>35rb</code> atau <code>75000</code>`);
   }
 
-  // ---- Edit Item ----
+  // ---- Edit Catatan (legacy callback: edit_item_) ----
   if (data.startsWith('edit_item_')) {
     const txId = parseInt(data.replace('edit_item_', ''));
     st.awaitingEditItem = txId;
-    return sendMessage(env, chatId, `📝 Ketik nama item baru untuk #${txId}:`);
+    return sendMessage(env, chatId, `📝 Ketik catatan baru untuk #${txId}:`);
   }
 
   // ---- Edit Tanggal ----
@@ -884,7 +924,7 @@ async function handleCallback(env, cb) {
     const tx = await env.DB.prepare('SELECT * FROM transactions WHERE id = ? AND user_id = ?').bind(txId, userId).first();
     if (!tx) return sendMessage(env, chatId, '❌ Transaksi gak ditemukan.');
     return sendMessageKb(env, chatId,
-      `🗑️ Hapus transaksi ini?\n\n${tx.item || tx.category} · ${rupiah(tx.amount)} · ${tx.tx_date}`,
+      `🗑️ Hapus transaksi ini?\n\n${tx.note || tx.item || tx.category} · ${rupiah(tx.amount)} · ${tx.tx_date}`,
       { inline_keyboard: [
         [{ text: '✅ Ya, Hapus', callback_data: `hapus_tx_confirm_${tx.id}` }],
         [{ text: '❌ Batal', callback_data: 'riwayat_1' }]
@@ -957,7 +997,7 @@ async function handleCallback(env, cb) {
     await answerCallback(env, cb.id, 'Di-undo');
     const icon = tx.type === 'income' ? '⬆️' : '⬇️';
     const sc = tx.scope === 'keluarga' ? '🏠' : '🙋';
-    return sendMessageKb(env, chatId, `↩️ Transaksi #${txId} dihapus.\n${sc} ${icon} ${tx.item || tx.category}: ${rupiah(tx.amount)}`, mainMenuKeyboard());
+    return sendMessageKb(env, chatId, `↩️ Transaksi #${txId} dihapus.\n${sc} ${icon} ${tx.note || tx.item || tx.category}: ${rupiah(tx.amount)}`, mainMenuKeyboard());
   }
 
   // ---- Ubah Kategori ----
@@ -1022,7 +1062,7 @@ async function handleCallback(env, cb) {
     await answerCallback(env, cb.id, 'Dihapus');
     const icon = tx.type === 'income' ? '⬆️' : '⬇️';
     const sc = tx.scope === 'keluarga' ? '🏠' : '🙋';
-    return sendMessageKb(env, chatId, `🗑️ Transaksi #${txId} dihapus.\n${sc} ${icon} ${tx.item || tx.category}: ${rupiah(tx.amount)} · ${tx.tx_date}`, settingsKeyboard(tx.scope));
+    return sendMessageKb(env, chatId, `🗑️ Transaksi #${txId} dihapus.\n${sc} ${icon} ${tx.note || tx.item || tx.category}: ${rupiah(tx.amount)} · ${tx.tx_date}`, settingsKeyboard(tx.scope));
   }
 
   // ---- Budget ----
@@ -1080,71 +1120,90 @@ async function handleCallback(env, cb) {
     return showCategoryManagement(env, chatId);
   }
 
+  // ---- Kategori Type Menu ----
+  if (data === 'kategori_expense_menu' || data === 'kategori_income_menu') {
+    const type = data === 'kategori_income_menu' ? 'income' : 'expense';
+    await answerCallback(env, cb.id, type === 'income' ? 'Pemasukan' : 'Pengeluaran');
+    return sendMessageKb(env, chatId, type === 'income' ? '⬆️ <b>Kategori Pemasukan</b>' : '💸 <b>Kategori Pengeluaran</b>', categoryTypeKeyboard(type));
+  }
+
   // ---- Kategori Add ----
-  if (data === 'kategori_add') {
-    st.awaitingCategoryName = true;
+  if (data === 'kategori_add' || data === 'kategori_income_add') {
+    const type = data === 'kategori_income_add' ? 'income' : 'expense';
+    st.awaitingCategoryName = { type };
     await answerCallback(env, cb.id, 'Tambah kategori');
-    return sendMessage(env, chatId, '📝 Ketik nama kategori baru:\n\nContoh: <code>dana darurat</code> atau <code>gift</code>');
+    return sendMessage(env, chatId, `📝 Ketik nama kategori ${type === 'income' ? 'pemasukan' : 'pengeluaran'} baru:\n\nContoh: <code>${type === 'income' ? 'Freelance' : 'dana darurat'}</code>`);
   }
 
   // ---- Kategori Edit List ----
-  if (data === 'kategori_edit_list') {
-    await answerCallback(env, cb.id, 'Edit kategori');
-    const keluargaCats = await getCategories(env.DB, 'keluarga');
-    const pribadiCats = await getCategories(env.DB, 'pribadi');
-    let out = '✏️ <b>Edit Kategori</b>\n\n🏠 Keluarga:\n';
+  if (data === 'kategori_edit_list' || data === 'kategori_income_edit_list') {
+    const type = data === 'kategori_income_edit_list' ? 'income' : 'expense';
+    await answerCallback(env, cb.id, type === 'income' ? 'Edit pemasukan' : 'Edit kategori');
+    const keluargaCats = await getCategories(env.DB, 'keluarga', type);
+    const pribadiCats = await getCategories(env.DB, 'pribadi', type);
+    const icon = type === 'income' ? '⬆️' : '💸';
+    let out = `✏️ <b>Edit Kategori ${type === 'income' ? 'Pemasukan' : 'Pengeluaran'}</b>\n\n🏠 Keluarga:\n`;
     out += keluargaCats.join(', ') + '\n\n🙋 Pribadi:\n';
     out += pribadiCats.join(', ') + '\n\nPilih kategori yang mau di-rename:';
     const kb = { inline_keyboard: [] };
     for (const sc of ['keluarga', 'pribadi']) {
       const cats = sc === 'keluarga' ? keluargaCats : pribadiCats;
-      const label = sc === 'keluarga' ? '🏠' : '🙋';
+      const scLabel = sc === 'keluarga' ? '🏠' : '🙋';
+      const prefix = type === 'income' ? 'kategori_income_edit' : 'kategori_edit';
       for (const c of cats) {
-        kb.inline_keyboard.push([{ text: `${label} ${c}`, callback_data: `kategori_edit_${sc}_${c}` }]);
+        kb.inline_keyboard.push([{ text: `${icon} ${scLabel} ${c}`, callback_data: `${prefix}_${sc}_${c}` }]);
       }
     }
-    kb.inline_keyboard.push([{ text: '⬅️ Kembali', callback_data: 'kategori' }]);
+    kb.inline_keyboard.push([{ text: '⬅️ Kembali', callback_data: type === 'income' ? 'kategori_income_menu' : 'kategori_expense_menu' }]);
     return sendMessageKb(env, chatId, out, kb);
   }
 
-  // ---- Kategori Edit ----
-  if (data.startsWith('kategori_edit_') && !data.endsWith('_list')) {
-    const parts = data.replace('kategori_edit_', '').split('_');
+  // ---- Kategori Edit (single item) ----
+  if ((data.startsWith('kategori_edit_') || data.startsWith('kategori_income_edit_')) && !data.endsWith('_list')) {
+    const isIncome = data.startsWith('kategori_income_edit_');
+    const raw = data.replace(isIncome ? 'kategori_income_edit_' : 'kategori_edit_', '');
+    const parts = raw.split('_');
     const scope = parts[0];
     const oldName = parts.slice(1).join('_');
-    st.awaitingCategoryRename = { scope, oldName };
+    const type = isIncome ? 'income' : 'expense';
+    st.awaitingCategoryRename = { scope, oldName, type };
     await answerCallback(env, cb.id, oldName);
     return sendMessage(env, chatId, `✏️ Rename "<b>${oldName}</b>" ke apa?\n\nKetik nama baru:`);
   }
 
   // ---- Kategori Hapus List ----
-  if (data === 'kategori_hapus_list') {
-    await answerCallback(env, cb.id, 'Hapus kategori');
-    const keluargaCats = await getCategories(env.DB, 'keluarga');
-    const pribadiCats = await getCategories(env.DB, 'pribadi');
-    let out = '🗑️ <b>Hapus Kategori</b>\n\nPilih kategori yang mau dihapus:';
+  if (data === 'kategori_hapus_list' || data === 'kategori_income_hapus_list') {
+    const type = data === 'kategori_income_hapus_list' ? 'income' : 'expense';
+    await answerCallback(env, cb.id, type === 'income' ? 'Hapus pemasukan' : 'Hapus kategori');
+    const keluargaCats = await getCategories(env.DB, 'keluarga', type);
+    const pribadiCats = await getCategories(env.DB, 'pribadi', type);
+    let out = `🗑️ <b>Hapus Kategori ${type === 'income' ? 'Pemasukan' : 'Pengeluaran'}</b>\n\nPilih kategori yang mau dihapus:`;
     const kb = { inline_keyboard: [] };
+    const icon = type === 'income' ? '⬆️' : '💸';
+    const prefix = type === 'income' ? 'kategori_income_hapus' : 'kategori_hapus';
     for (const sc of ['keluarga', 'pribadi']) {
       const cats = sc === 'keluarga' ? keluargaCats : pribadiCats;
-      const label = sc === 'keluarga' ? '🏠' : '🙋';
+      const scLabel = sc === 'keluarga' ? '🏠' : '🙋';
       for (const c of cats) {
-        kb.inline_keyboard.push([{ text: `🗑️ ${label} ${c}`, callback_data: `kategori_hapus_${sc}_${c}` }]);
+        kb.inline_keyboard.push([{ text: `${icon} ${scLabel} ${c}`, callback_data: `${prefix}_${sc}_${c}` }]);
       }
     }
-    kb.inline_keyboard.push([{ text: '⬅️ Kembali', callback_data: 'kategori' }]);
+    kb.inline_keyboard.push([{ text: '⬅️ Kembali', callback_data: type === 'income' ? 'kategori_income_menu' : 'kategori_expense_menu' }]);
     return sendMessageKb(env, chatId, out, kb);
   }
 
-  // ---- Kategori Hapus ----
-  if (data.startsWith('kategori_hapus_') && !data.endsWith('_list')) {
-    const parts = data.replace('kategori_hapus_', '').split('_');
+  // ---- Kategori Hapus (single item) ----
+  if ((data.startsWith('kategori_hapus_') || data.startsWith('kategori_income_hapus_')) && !data.endsWith('_list')) {
+    const isIncome = data.startsWith('kategori_income_hapus_');
+    const raw = data.replace(isIncome ? 'kategori_income_hapus_' : 'kategori_hapus_', '');
+    const parts = raw.split('_');
     const scope = parts[0];
     const catName = parts.slice(1).join('_');
-    // Remove from D1
-    const deleted = await deleteCategoryFromDb(env.DB, scope, catName);
+    const type = isIncome ? 'income' : 'expense';
+    const deleted = await deleteCategoryFromDb(env.DB, scope, catName, type);
     if (deleted) {
       await answerCallback(env, cb.id, 'Dihapus');
-      return sendMessage(env, chatId, `🗑️ Kategori "<b>${catName}</b>" dihapus dari ${scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi'}.`);
+      return sendMessage(env, chatId, `🗑️ Kategori "<b>${catName}</b>" dihapus dari ${scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi'} (${type === 'income' ? 'pemasukan' : 'pengeluaran'}).`);
     }
     await answerCallback(env, cb.id, 'Gak ditemukan');
     return sendMessage(env, chatId, `❌ Kategori "${catName}" gak ditemukan atau kategori default.`);
@@ -1164,13 +1223,14 @@ async function handleCallback(env, cb) {
       return sendMessageKb(env, chatId, '❌ Draft tidak ditemukan.', mainMenuKeyboard());
     }
     const d = draft.parsed;
-    await handleCatat(env, userId, d.scope, d.type || 'expense', d.amount, d.category, `regex: ${d.item || d.category}`, d.date, d.item || null);
+    const note = d.note || d.item || null;
+    await handleCatat(env, userId, d.scope, d.type || 'expense', d.amount, d.category, note, d.date, null);
     await deleteDraft(env, userId);
     const newTx = await env.DB.prepare('SELECT id FROM transactions WHERE user_id = ? ORDER BY id DESC LIMIT 1').bind(userId).first();
     if (newTx) st.lastUndoId = newTx.id;
     const scopeLabel = d.scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi';
     const icon = d.type === 'income' ? '⬆️' : '⬇️';
-    let reply = `✅ Dicatat!\n${scopeLabel} · ${icon} ${d.category} · <b>${rupiah(d.amount)}</b>\n${d.item ? 'Item: ' + d.item + '\n' : ''}📅 ${d.date}`;
+    let reply = `✅ Dicatat!\n${scopeLabel} · ${icon} ${d.category} · <b>${rupiah(d.amount)}</b>\n${note ? 'Catatan: ' + note + '\n' : ''}📅 ${d.date}`;
     const alert = await checkBudgetAlert(env, d.scope, d.amount);
     if (alert) reply += '\n\n' + alert;
     await answerCallback(env, cb.id, 'Tersimpan');
@@ -1196,7 +1256,7 @@ async function handleCallback(env, cb) {
     await answerCallback(env, cb.id, `Jenis: ${typeLabel}`);
     let summary = `📝 <b>Draft Catatan</b>\n\n`;
     summary += `Jenis: ${typeLabel}\n`;
-    summary += `Item: ${d.item || '-'}\n`;
+    summary += `Catatan: ${d.note || d.item || '-'}\n`;
     summary += `Nominal: <b>${rupiah(d.amount)}</b>\n`;
     summary += `Kategori: ${d.category}\n`;
     summary += `Dompet: ${d.scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi'}\n`;
@@ -1214,13 +1274,20 @@ async function handleCallback(env, cb) {
     const scopeLabel = d.scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi';
     await answerCallback(env, cb.id, `Dompet: ${scopeLabel}`);
     let summary = `📝 <b>Draft Catatan</b>\n\n`;
-    summary += `Item: ${d.item || '-'}\n`;
+    summary += `Catatan: ${d.note || d.item || '-'}\n`;
     summary += `Nominal: <b>${rupiah(d.amount)}</b>\n`;
     summary += `Kategori: ${d.category}\n`;
     summary += `Dompet: ${scopeLabel}\n`;
     summary += `Tanggal: ${d.date}\n`;
     summary += `\nPilih aksi:`;
     return sendMessageKb(env, chatId, summary, draftKeyboard(d.scope, d.type));
+  }
+
+  // ---- Draft: Add/edit note ----
+  if (data === 'draft_note') {
+    st.awaitingDraftNote = true;
+    await answerCallback(env, cb.id, 'Ketik catatan');
+    return sendMessage(env, chatId, '📝 Ketik catatan transaksi. Contoh: <code>Susu SGM Soya</code>');
   }
 
   // ---- Draft: Change date ----
@@ -1235,7 +1302,7 @@ async function handleCallback(env, cb) {
     await answerCallback(env, cb.id, `Tanggal: ${dateLabel}`);
     const scopeLabel = d.scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi';
     let summary = `📝 <b>Draft Catatan</b>\n\n`;
-    summary += `Item: ${d.item || '-'}\n`;
+    summary += `Catatan: ${d.note || d.item || '-'}\n`;
     summary += `Nominal: <b>${rupiah(d.amount)}</b>\n`;
     summary += `Kategori: ${d.category}\n`;
     summary += `Dompet: ${scopeLabel}\n`;
@@ -1258,7 +1325,7 @@ async function handleCallback(env, cb) {
     const d = draft.parsed;
     const scopeLabel = d.scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi';
     let summary = `📝 <b>Draft Catatan</b>\n\n`;
-    summary += `Item: ${d.item || '-'}\n`;
+    summary += `Catatan: ${d.note || d.item || '-'}\n`;
     summary += `Nominal: <b>${rupiah(d.amount)}</b>\n`;
     summary += `Kategori: ${d.category}\n`;
     summary += `Dompet: ${scopeLabel}\n`;
@@ -1268,14 +1335,40 @@ async function handleCallback(env, cb) {
     return sendMessageKb(env, chatId, summary, draftKeyboard(d.scope, d.type));
   }
 
-  // ---- Draft: Pick category ----
+  // ---- Income/Expense Quick Start ----
+  if (data === 'income_start' || data === 'expense_start') {
+    const userRow = await env.DB.prepare('SELECT scope FROM users WHERE telegram_id = ?').bind(userId).first();
+    const scope = userRow?.scope || 'keluarga';
+    const type = data === 'income_start' ? 'income' : 'expense';
+    const defaultCat = type === 'income' ? 'Gaji' : 'Lainnya';
+    const scopeLabel = scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi';
+    const typeLabel = type === 'income' ? '⬆️ Pemasukan' : '💸 Pengeluaran';
+
+    // Buat draft kosong — user pilih kategori dulu, baru ketik nominal
+    const draft = {
+      scope,
+      type,
+      category: defaultCat,
+      amount: 0,
+      note: null,
+      date: todayStr(),
+    };
+    await saveDraft(env, userId, draft);
+
+    // Tampilkan income category picker
+    const kb = await regexCategoryPicker(env.DB, scope, type);
+    await answerCallback(env, cb.id, typeLabel);
+    return sendMessageKb(env, chatId, `💡 <b>${typeLabel}</b> (${scopeLabel})\nPilih kategori:`, kb);
+  }
+
+  // ---- Draft: Pick category (from existing draft via draft button) ----
   if (data === 'draft_pick_cat') {
     const draft = await getDraft(env, userId);
     if (!draft) { await answerCallback(env, cb.id, 'Error'); return; }
     const d = draft.parsed;
-    const kb = await regexCategoryPicker(env.DB, d.scope);
+    const kb = await regexCategoryPicker(env.DB, d.scope, d.type);
     await answerCallback(env, cb.id, 'Pilih kategori');
-    return sendMessageKb(env, chatId, `🏷️ Pilih kategori untuk <b>${d.item || 'transaksi'}</b>:`, kb);
+    return sendMessageKb(env, chatId, `🏷️ Pilih kategori untuk <b>${d.note || d.item || 'transaksi'}</b>:`, kb);
   }
 
   // ---- Draft: Set category ----
@@ -1286,9 +1379,17 @@ async function handleCallback(env, cb) {
     const newCat = data.replace('draft_set_cat_', '');
     d.category = newCat;
     await saveDraft(env, userId, d);
+
+    // Jika amount masih 0 (dari income/expense quick start), minta user ketik nominal
+    if (!d.amount || d.amount === 0) {
+      st.awaitingDraftAmount = true;
+      await answerCallback(env, cb.id, `Kategori: ${newCat}`);
+      return sendMessage(env, chatId, `💡 Ketik nominal, contoh: <code>3.5jt</code> atau <code>50rb</code>`);
+    }
+
     const scopeLabel = d.scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi';
     let summary = `📝 <b>Draft Catatan</b>\n\n`;
-    summary += `Item: ${d.item || '-'}\n`;
+    summary += `Catatan: ${d.note || d.item || '-'}\n`;
     summary += `Nominal: <b>${rupiah(d.amount)}</b>\n`;
     summary += `Kategori: ${d.category}\n`;
     summary += `Dompet: ${scopeLabel}\n`;
@@ -1382,7 +1483,7 @@ async function handleMessage(env, msg) {
 
       const scope = parsed.scope || defaultScope;
       const type = parsed.type || 'expense';
-      const category = (await matchCategory(env.DB, parsed.category, scope)) || 'Lainnya';
+      const category = (await explicitCategoryFromText(env.DB, text, scope)) || (await matchCategory(env.DB, parsed.category, scope)) || 'Lainnya';
       const date = parsed.date || todayStr();
 
       // Normalize items
@@ -1479,7 +1580,7 @@ async function handleMessage(env, msg) {
     const list = results.map(r => {
       const icon = r.type === 'income' ? '⬆️' : '⬇️';
       const sc = r.scope === 'keluarga' ? '🏠' : '🙋';
-      return `<code>#${r.id}</code> ${sc} ${icon} ${r.item || r.category}: ${rupiah(r.amount)} · ${r.tx_date}`;
+      return `<code>#${r.id}</code> ${sc} ${icon} ${r.note || r.item || r.category}: ${rupiah(r.amount)} · ${r.tx_date}`;
     }).join('\n');
     return sendMessageKb(env, chatId, `🔍 <b>Transaksi yang cocok:</b>\n\n${list}\n\nPilih yang mau dihapus:`, deleteSearchResultKeyboard(results));
   }
@@ -1513,22 +1614,24 @@ async function handleMessage(env, msg) {
 
   // Awaiting: Category rename
   if (st.awaitingCategoryRename) {
-    const { scope, oldName } = st.awaitingCategoryRename;
+    const { scope, oldName, type } = st.awaitingCategoryRename;
     st.awaitingCategoryRename = null;
+    const catType = type || 'expense';
     const newName = text.trim();
     if (!newName || newName.length < 2) {
       return sendMessage(env, chatId, '⚠️ Nama kategori terlalu pendek. Ketik nama baru.');
     }
     const formatted = newName.charAt(0).toUpperCase() + newName.slice(1).toLowerCase();
-    const renamed = await renameCategoryInDb(env.DB, scope, oldName, formatted);
+    const renamed = await renameCategoryInDb(env.DB, scope, oldName, formatted, catType);
     if (renamed) {
       return sendMessageKb(env, chatId, `✅ "<b>${oldName}</b>" → "<b>${formatted}</b>"`, categoryManagementKeyboard());
     }
     return sendMessage(env, chatId, `❌ Kategori "${oldName}" gak ditemukan.`);
   }
 
-  // Awaiting: Category name
+  // Awaiting: Category name (add — expense or income)
   if (st.awaitingCategoryName) {
+    const catType = (typeof st.awaitingCategoryName === 'object' && st.awaitingCategoryName.type) ? st.awaitingCategoryName.type : 'expense';
     st.awaitingCategoryName = false;
     const catName = text.trim();
     if (!catName || catName.length < 2) {
@@ -1537,9 +1640,52 @@ async function handleMessage(env, msg) {
     const formatted = catName.charAt(0).toUpperCase() + catName.slice(1).toLowerCase();
     // Add to D1 for both scopes
     for (const sc of ['keluarga', 'pribadi']) {
-      await addCategoryToDb(env.DB, sc, formatted);
+      await addCategoryToDb(env.DB, sc, formatted, catType);
     }
-    return sendMessageKb(env, chatId, `✅ Kategori "<b>${formatted}</b>" ditambahkan ke Keluarga & Pribadi.`, categoryManagementKeyboard());
+    const typeLabel = catType === 'income' ? 'pemasukan' : 'pengeluaran';
+    return sendMessageKb(env, chatId, `✅ Kategori ${typeLabel} "<b>${formatted}</b>" ditambahkan ke Keluarga & Pribadi.`, categoryManagementKeyboard());
+  }
+
+  // Awaiting: Draft note
+  if (st.awaitingDraftNote) {
+    st.awaitingDraftNote = false;
+    const draft = await getDraft(env, userId);
+    if (!draft) return sendMessageKb(env, chatId, '❌ Draft tidak ditemukan.', mainMenuKeyboard());
+    const d = draft.parsed;
+    d.note = text.trim();
+    await saveDraft(env, userId, d);
+    const scopeLabel = d.scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi';
+    let summary = `📝 <b>Draft Catatan</b>\n\n`;
+    summary += `Catatan: ${d.note || '-'}\n`;
+    summary += `Nominal: <b>${rupiah(d.amount)}</b>\n`;
+    summary += `Kategori: ${d.category}\n`;
+    summary += `Dompet: ${scopeLabel}\n`;
+    summary += `Tanggal: ${d.date}\n\nPilih aksi:`;
+    return sendMessageKb(env, chatId, summary, draftKeyboard(d.scope, d.type));
+  }
+
+  // Awaiting: Draft amount from quick income/expense start
+  if (st.awaitingDraftAmount) {
+    st.awaitingDraftAmount = false;
+    const amount = parseAmount(text);
+    if (!amount) {
+      st.awaitingDraftAmount = true;
+      return sendMessage(env, chatId, '⚠️ Nominal gak valid. Contoh: <code>3.5jt</code>, <code>500rb</code>, atau <code>500000</code>');
+    }
+    const draft = await getDraft(env, userId);
+    if (!draft) return sendMessageKb(env, chatId, '❌ Draft tidak ditemukan.', mainMenuKeyboard());
+    const d = draft.parsed;
+    d.amount = amount;
+    await saveDraft(env, userId, d);
+    const scopeLabel = d.scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi';
+    const typeLabel = d.type === 'income' ? '⬆️ Pendapatan' : '⬇️ Pengeluaran';
+    let summary = `📝 <b>Draft Catatan</b>\n\n`;
+    summary += `Jenis: ${typeLabel}\n`;
+    summary += `Nominal: <b>${rupiah(d.amount)}</b>\n`;
+    summary += `Kategori: ${d.category}\n`;
+    summary += `Dompet: ${scopeLabel}\n`;
+    summary += `Tanggal: ${d.date}\n\nPilih aksi:`;
+    return sendMessageKb(env, chatId, summary, draftKeyboard(d.scope, d.type));
   }
 
   // Awaiting: Draft custom date
@@ -1552,7 +1698,7 @@ async function handleMessage(env, msg) {
     await saveDraft(env, userId, d);
     const scopeLabel = d.scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi';
     let summary = `📝 <b>Draft Catatan</b>\n\n`;
-    summary += `Item: ${d.item || '-'}\n`;
+    summary += `Catatan: ${d.note || d.item || '-'}\n`;
     summary += `Nominal: <b>${rupiah(d.amount)}</b>\n`;
     summary += `Kategori: ${d.category}\n`;
     summary += `Dompet: ${scopeLabel}\n`;
@@ -1561,17 +1707,16 @@ async function handleMessage(env, msg) {
     return sendMessageKb(env, chatId, summary, draftKeyboard(d.scope, d.type));
   }
 
-  // Awaiting: Edit item for existing transaction
+  // Awaiting: Edit catatan for existing transaction
   if (st.awaitingEditItem) {
     const txId = st.awaitingEditItem;
     st.awaitingEditItem = null;
-    const newItem = text.trim();
-    if (!newItem || newItem.length < 2) {
-      return sendMessage(env, chatId, '⚠️ Nama item terlalu pendek.');
+    const newNote = text.trim();
+    if (!newNote || newNote.length < 2) {
+      return sendMessage(env, chatId, '⚠️ Catatan terlalu pendek.');
     }
-    const formatted = newItem.charAt(0).toUpperCase() + newItem.slice(1).toLowerCase();
-    await env.DB.prepare('UPDATE transactions SET item = ? WHERE id = ? AND user_id = ?').bind(formatted, txId, userId).run();
-    return sendMessageKb(env, chatId, `✅ Item #${txId} diupdate ke "<b>${formatted}</b>"`, mainMenuKeyboard());
+    await env.DB.prepare('UPDATE transactions SET note = ?, item = ? WHERE id = ? AND user_id = ?').bind(newNote, newNote, txId, userId).run();
+    return sendMessageKb(env, chatId, `✅ Catatan #${txId} diupdate`, mainMenuKeyboard());
   }
 
   // Awaiting: Edit date for existing transaction
@@ -1591,13 +1736,14 @@ async function handleMessage(env, msg) {
     // STEP 1: Try regex parse (no AI cost)
     const regexResult = regexParse(text);
 
-    if (regexResult && regexResult.amount) {
+    if (regexResult && regexResult.amount && !/kategori|catatan/i.test(text)) {
       // Save draft to D1 and show summary
+      const regexCategory = await explicitCategoryFromText(env.DB, text, defaultScope);
       const draft = {
-        item: regexResult.item,
+        note: regexResult.note,
         amount: regexResult.amount,
         scope: defaultScope,
-        category: 'Lainnya',
+        category: regexCategory || 'Lainnya',
         date: todayStr(),
         type: regexResult.type || 'expense',
       };
@@ -1606,9 +1752,9 @@ async function handleMessage(env, msg) {
       const typeLabel = draft.type === 'income' ? '⬆️ Pendapatan' : '⬇️ Pengeluaran';
       let summary = `📝 <b>Draft Catatan</b>\n\n`;
       summary += `Jenis: ${typeLabel}\n`;
-      summary += `Item: ${regexResult.item}\n`;
+      summary += `Catatan: ${regexResult.note || '-'}\n`;
       summary += `Nominal: <b>${rupiah(regexResult.amount)}</b>\n`;
-      summary += `Kategori: Lainnya\n`;
+      summary += `Kategori: ${draft.category}\n`;
       summary += `Dompet: ${scopeLabel}\n`;
       summary += `Tanggal: ${draft.date}\n`;
       summary += `\nPilih aksi:`;
@@ -1631,12 +1777,12 @@ async function handleMessage(env, msg) {
       }
       const scope = parsed.scope || defaultScope;
       const type = parsed.type || 'expense';
-      const category = (await matchCategory(env.DB, parsed.category, scope)) || 'Lainnya';
+      const category = (await explicitCategoryFromText(env.DB, text, scope)) || (await matchCategory(env.DB, parsed.category, scope)) || 'Lainnya';
       const date = parsed.date || todayStr();
 
       // Save draft, not direct save
       const draft = {
-        item: parsed.item || null,
+        note: parsed.note || parsed.item || null,
         amount: parsed.amount,
         scope,
         category,
@@ -1647,7 +1793,7 @@ async function handleMessage(env, msg) {
       const scopeLabel = scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi';
       const icon = type === 'income' ? '⬆️' : '⬇️';
       let summary = `📝 <b>Draft Catatan</b>\n\n`;
-      summary += `Item: ${parsed.item || '-'}\n`;
+      summary += `Catatan: ${parsed.note || parsed.item || '-'}\n`;
       summary += `Nominal: <b>${rupiah(parsed.amount)}</b>\n`;
       summary += `Kategori: ${category}\n`;
       summary += `Dompet: ${scopeLabel} ${icon}\n`;
