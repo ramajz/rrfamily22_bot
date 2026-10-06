@@ -100,16 +100,53 @@ Urutan prioritas (aman → berbahaya):
   hasil `cari_transaksi`, lalu menawarkan (dengan konfirmasi untuk aksi tulis).
 - Trim: simpan maksimal N baris (mis. 100/user), hapus yang terlama.
 
-### 5.4 `tanya_data` — kemampuan baru
-Pola query-terbatas, BUKAN SQL bebas dari AI:
-- Daftar agregat yang diizinkan: total, jumlah, rata-rata, min/max, per kategori,
-  per dompet, rentang tanggal.
-- AI memilih parameter (kolom, filter, periode) → query dibangun oleh kode
-  terstruktur (parameterized), bukan string SQL mentah dari model.
-- Hasil query → AI menyusun jawaban natural.
+### 5.4 `tanya_data` — kemampuan baru (SQL bebas dengan guard)
 
-**Mengapa bukan SQL bebas:** D1 dari prompt model = risiko error & kebocoran
-struktur; query terbatas cukup untuk 95% pertanyaan rumah tangga.
+Keputusan Rama (2026-10-06): **SQL bebas** biar diskusi natural — AI menulis
+query sendiri, bukan dibatasi daftar agregat. Digabung dengan guard ketat.
+
+**Alur:**
+
+```
+Pertanyaan bebas
+  → AI menulis SELECT (didukung DDL schema di system prompt)
+  → GUARD cek (lihat 5.5) → jalankan di D1
+  → hasil masuk prompt → AI menyusun jawaban
+  → query ikut ditampilkan di jawaban (transparansi)
+  → query error → AI dikasih pesan error, boleh revisi 1x,
+    kalau masih error → jawab "data tidak ditemukan"
+```
+
+**Kenapa butuh guard:** pengalaman pribadi Rama — AI (termasuk agent ini)
+pernah tidak sengaja menghapus data yang seharusnya tidak disentuh. Riwayat bot
+sendiri juga punya bukti: bug bind order `handleCatat` (note/tx_date ketukar)
+dan `/hapus` yang salah ngehijack angka. Satu SELECT-vs-DELETE yang salah di
+aplikasi duit = riwayat hilang tanpa undo.
+
+### 5.5 SQL Guard (wajib untuk semua query AI)
+
+Implementasi di kode bot, bukan di prompt — **guard tidak bisa dinegosiasi
+model:**
+
+1. **Read-only gate:** query hanya boleh diawali `SELECT` atau `WITH`
+   (setelah trim/hapus komentar). Kata apapun lain → tolak total.
+   Deteksi juga `INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|ATTACH|PRAGMA`
+   di dalam query — kalau ketemu → tolak (bukan blocklist utama,
+   ini lapis kedua).
+2. **Auto-LIMIT:** query tanpa `LIMIT` → ditambah `LIMIT 100` otomatis.
+   `LIMIT > 1000` → clamp ke 1000.
+3. **Hanya database bot:** `ATTACH DATABASE` dkk ditolak (gak ada akses ke
+   file lain selain D1 binding).
+4. **Transparansi:** query yang dijalankan SELALU ikut ditampilkan di jawaban
+   (Rama jadi reviewer alami tiap kali).
+5. **Result → prompt, bukan kepala AI:** angka dalam jawaban dihitung dari
+   result set. System prompt: "Jangan mengarang angka; kalau query gagal
+   atau kosong, bilang begitu."
+6. **Revisi terbatas:** maksimal 1 retry kalau query error, lalu menyerah
+   dengan jawaban jujur.
+
+Schema D1 (DDL 5 tabel + chat_history) disertakan di system prompt supaya AI
+tidak menebak nama kolom.
 
 ## 6. Guardrail (wajib)
 
@@ -150,6 +187,10 @@ CREATE INDEX IF NOT EXISTS idx_chat_user ON chat_history(user_id, id DESC);
 - [ ] Tombol lama & command `/riwayat`, `/sisa`, `/harga` tetap berfungsi
       identik dengan v2.1.
 - [ ] AI timeout/gagal → fallback ke parser lama (pesan tetap terlayani).
+- [ ] Pertanyaan bebas yang butuh SQL kompleks dijawab benar (query tampil).
+- [ ] Percobaan query non-SELECT (contoh uji: teks yang memaksa DELETE)
+      DITOLAK guard, bukan dieksekusi.
+- [ ] Query tanpa LIMIT otomatis dapat LIMIT 100.
 - [ ] User non-whitelist tetap ditolak.
 - [ ] `node --check src/index.js` lolos sebelum setiap deploy.
 
@@ -170,7 +211,7 @@ Synthetic POST wajib menyertakan objek `message`/`callback_query` yang lengkap
 
 - BUKAN multi-user SaaS / komersialisasi.
 - Bukan penghapusan tombol (UI tetap button-first).
-- Bukan SQL bebas dari AI.
+- SQL bebas DIPERBOLEHKAN — tapi hanya SELECT/WITH dengan guard (5.5); write tetap lewat konfirmasi.
 - Bukan migrasi DB.
 - Bukan perubahan whitelist / arsitektur Hono-D1.
 - Bukan deploy otomatis — merge ke main = keputusan sadar.
@@ -182,6 +223,8 @@ Synthetic POST wajib menyertakan objek `message`/`callback_query` yang lengkap
 - Whitelist & fungsi kirim pesan Telegram lama.
 - Jangan `wrangler deploy` dari branch ini.
 - Jangan mencetak API key/token ke mana pun.
+- Jangan melonggarkan SQL guard (read-only gate, auto-LIMIT) tanpa diskusi —
+  ini pengalaman langsung Rama soal AI yang salah menghapus data.
 
 ## 12. Milestone
 
