@@ -38,7 +38,10 @@ Aturan keras:
 2. Jika tool gagal atau hasil kosong, bilang apa adanya — jangan mengkarang.
 3. Jawab ringkas, bahasa Indonesia santai, format Telegram HTML (<b>, <code>).
 4. Untuk MENULIS data (catat transaksi, edit, hapus, set budget): balas HANYA teks "[FALLBACK]" — sistem yang mengarahkan ke flow catat/tombol konfirmasi. Jangan jelaskan panjang lebar.
-5. Sebut satuan penuh (rupiah), jangan pakai format aneh.`;
+5. Sebut satuan penuh (rupiah), jangan pakai format aneh.
+6. Untuk pertanyaan analitis/apapun yang butuh query data bebas, pakai tool tanya_data.
+   Tulis SATU query SELECT/WITH SQLite yang valid. Jika query ditolak atau error,
+   boleh revisi MAKSIMAL 1x; kalau gagal lagi, jawab jujur "data tidak ditemukan".`;
 
 // Wrapper Syncera — native Anthropic Messages API
 async function callClaude(env, { system, messages, tools }) {
@@ -126,6 +129,21 @@ const TOOLS = [
       required: ['keyword'],
     },
   },
+  {
+    name: 'tanya_data',
+    description:
+      'Jalankan query SQL HANYA-READ (SELECT atau WITH) untuk pertanyaan analitis bebas. ' +
+      'Tulis satu query SQLite yang benar sesuai skema database. Guard akan menolak non-SELECT, ' +
+      'menambah LIMIT otomatis, dan query yang gagal boleh direvisi 1x.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        sql: { type: 'string', description: 'Satu statement SELECT atau WITH (SQLite dialect)' },
+        alasan: { type: 'string', description: 'Singkat: apa yang dijawab query ini' },
+      },
+      required: ['sql'],
+    },
+  },
 ];
 
 // Eksekusi tool → hasil JSON string (yang dikirim balik ke model sebagai tool_result)
@@ -205,7 +223,56 @@ async function runTool(env, userId, name, args) {
     return JSON.stringify({ keyword: kw, count: rows.length, min, max, trend, last5 });
   }
 
+
+  if (name === 'tanya_data') {
+    const guard = sqlGuard(String(args.sql || ''));
+    if (guard.rejected) return JSON.stringify({ error: guard.reason, ditolak_oleh: 'sql_guard' });
+    const res = await db.prepare(guard.sql).all();
+    const rows = (res.results || []).slice(0, 100);
+    return JSON.stringify({ query: guard.sql, alasan: args.alasan || null, row_count: rows.length, rows });
+  }
+
   return JSON.stringify({ error: `tool tidak dikenal: ${name}` });
+}
+
+// ── SQL Guard (PRD 5.5) — di KODE, bukan di prompt ────────────────────
+// Cuma SELECT/WITH yang lolos; auto-LIMIT; blokir statement berbahaya.
+function sqlGuard(raw) {
+  let q = String(raw || '').trim();
+  if (!q) return { rejected: true, reason: 'query kosong' };
+
+  // buang komentar SQL dulu (// dan /* */ dan --), tapi HANYA jika tidak di dalam string.
+  // Pendekatan konservatif: tolak query yang mengandung komentar baris/block yang mencurigakan
+  // bersamaan dengan keyword berbahaya — cukup aman untuk use case rumah tangga.
+  const noComment = q.replace(/--[^\n]*/g, ' ').replace(/\/\*[\s\S]*?\*\//g, ' ');
+
+  // Lapis 1: harus diawali SELECT atau WITH (setelah trim)
+  const head = noComment.trimStart().toUpperCase();
+  if (!(head.startsWith('SELECT') || head.startsWith('WITH'))) {
+    return { rejected: true, reason: 'hanya query SELECT/WITH yang diizinkan' };
+  }
+
+  // Lapis 2: blokir keyword tulis/destruktif di posisi statement (split semicolon)
+  const banned = /\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|REPLACE|ATTACH|DETACH|PRAGMA|VACUUM|CREATE|GRANT|REVOKE)\b/i;
+  // izinkan kata-kata yang muncul di dalam string literal? cukup aman karena kasus kita terbatas:
+  // kalau ada keyword banned di luar string, tolak.
+  if (banned.test(noComment)) {
+    return { rejected: true, reason: 'query mengandung operasi non-READ (ditolak guard)' };
+  }
+
+  // Lapis 3: auto-LIMIT
+  let finalQ = noComment.replace(/;+\s*$/, '').trim();
+  if (!/\bLIMIT\s+\d+/i.test(finalQ)) {
+    finalQ += ' LIMIT 100';
+  } else {
+    // clamp LIMIT > 1000
+    finalQ = finalQ.replace(/\bLIMIT\s+(\d+)/i, (m, n) => {
+      const num = parseInt(n, 10);
+      return num > 1000 ? 'LIMIT 1000' : `LIMIT ${num}`;
+    });
+  }
+  if (finalQ.length > 4000) return { rejected: true, reason: 'query terlalu panjang' };
+  return { rejected: false, sql: finalQ };
 }
 
 // ── Router utama M1 ────────────────────────────────────────────────────
@@ -275,4 +342,4 @@ async function runAgent(env, msg, text, reply) {
   }
 }
 
-export { runAgent };
+export { runAgent, sqlGuard };
