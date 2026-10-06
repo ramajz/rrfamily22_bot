@@ -1815,9 +1815,29 @@ async function handleMessage(env, msg) {
     // STEP 1.5: v3 agent (M1) — pertanyaan baca via Syncera (read-only tools).
     // Agent hanya menangani PERTANYAAN. Jika butuh menulis data, model membalas
     // [FALLBACK] dan kita lanjut ke STEP 2 (parser lama) — flow tulis TIDAK berubah.
-    const agentOk = await runAgent(env, msg, text, (cid, ft) =>
-      sendMessageKb(env, cid, ft, mainMenuKeyboard())
-    );
+    let agentDraft = false;
+    const agentOk = await runAgent(env, msg, text, async (cid, ft, mode) => {
+      // M4: draft staged → tampilkan konfirmasi tombol (flow lama)
+      if (mode === 'draft') {
+        const d = await getDraft(env, userId);
+        if (d) {
+          const pd = d.parsed;
+          const scopeLabel = pd.scope === 'keluarga' ? '🏠 Keluarga' : '🙋 Pribadi';
+          const typeLabel = pd.type === 'income' ? '⬆️ Pendapatan' : '⬇️ Pengeluaran';
+          let summary = ft ? ft + '\n\n' : '';
+          summary += `📝 <b>Draft Catatan</b>\n\n`;
+          summary += `Jenis: ${typeLabel}\n`;
+          summary += `Catatan: ${pd.note || '-'}\n`;
+          summary += `Nominal: <b>${rupiah(pd.amount)}</b>\n`;
+          summary += `Kategori: ${pd.category}\n`;
+          summary += `Dompet: ${scopeLabel}\n`;
+          summary += `Tanggal: ${pd.date}\n\nPilih aksi:`;
+          agentDraft = true;
+          return sendMessageKb(env, cid, summary, draftKeyboard(pd.scope, pd.type));
+        }
+      }
+      return sendMessageKb(env, cid, ft, mainMenuKeyboard());
+    });
     if (agentOk) return;
 
     // STEP 2: AI fallback (only for complex input)

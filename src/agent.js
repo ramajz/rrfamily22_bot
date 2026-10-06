@@ -37,7 +37,7 @@ Aturan keras:
 1. Angka (rupiah, jumlah, tanggal) HARUS dari hasil tool. Jangan pernah mengarang angka.
 2. Jika tool gagal atau hasil kosong, bilang apa adanya — jangan mengkarang.
 3. Jawab ringkas, bahasa Indonesia santai, format Telegram HTML (<b>, <code>).
-4. Untuk MENULIS data (catat transaksi, edit, hapus, set budget): balas HANYA teks "[FALLBACK]" — sistem yang mengarahkan ke flow catat/tombol konfirmasi. Jangan jelaskan panjang lebar.
+4. Untuk CATAT transaksi: pakai tool siapkan_draft (SISTEM yang menampilkan konfirmasi tombol). Sebut di jawaban teks kalau ada transaksi lain di pesan yang sama (staged draft hanya untuk yang pertama). Untuk edit/hapus/set budget pakai [FALLBACK].
 5. Sebut satuan penuh (rupiah), jangan pakai format aneh.
 6. Untuk pertanyaan analitis/apapun yang butuh query data bebas, pakai tool tanya_data.
    Tulis SATU query SELECT/WITH SQLite yang valid. Jika query ditolak atau error,
@@ -127,6 +127,26 @@ const TOOLS = [
         keyword: { type: 'string' },
       },
       required: ['keyword'],
+    },
+  },
+  {
+    name: 'siapkan_draft',
+    description:
+      'Untuk MENYIMPAN transaksi (catat): siapkan satu draft transaksi. ' +
+      'Sistem akan menampilkan ringkasan + tombol konfirmasi ke user. ' +
+      'Panggil SATU draft per pesan. Jika pesan berisi lebih dari satu transaksi, ' +
+      'siapkan yang pertama saja dan sebutkan sisanya di jawaban teks (user mengirim lagi setelah konfirmasi).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        type: { type: 'string', enum: ['expense', 'income'] },
+        amount: { type: 'integer', description: 'Nominal dalam rupiah (angka bulat)' },
+        scope: { type: 'string', enum: ['keluarga', 'pribadi'] },
+        category: { type: 'string', description: 'Kategori, mis. Makan, Transport, Jajan' },
+        note: { type: 'string', description: 'Catatan/item singkat' },
+        date: { type: 'string', description: 'YYYY-MM-DD, default hari ini' },
+      },
+      required: ['type', 'amount', 'scope', 'category'],
     },
   },
   {
@@ -223,6 +243,26 @@ async function runTool(env, userId, name, args) {
     return JSON.stringify({ keyword: kw, count: rows.length, min, max, trend, last5 });
   }
 
+
+  if (name === 'siapkan_draft') {
+    // tulis ke pending_input sebagai draft (action catat_draft) — sama dengan saveDraft()
+    // transaksi BELUM masuk transactions; butuh konfirmasi tombol draft_save
+    const type = args.type === 'income' ? 'income' : 'expense';
+    const amount = Math.round(Number(args.amount) || 0);
+    const scope = args.scope === 'pribadi' ? 'pribadi' : 'keluarga';
+    const category = String(args.category || 'Lainnya').slice(0, 40);
+    const note = String(args.note || '').slice(0, 120);
+    const date = /^\d{4}-\d{2}-\d{2}$/.test(String(args.date || '')) ? args.date : todayStr();
+    if (amount <= 0) return JSON.stringify({ error: 'amount tidak valid' });
+    const draft = { type, amount, scope, category, note, date };
+    await db
+      .prepare(
+        'INSERT OR REPLACE INTO pending_input (telegram_id, action, scope, category, data) VALUES (?, ?, ?, ?, ?)'
+      )
+      .bind(userId, 'catat_draft', scope, category, JSON.stringify(draft))
+      .run();
+    return JSON.stringify({ staged: true, draft });
+  }
 
   if (name === 'tanya_data') {
     const guard = sqlGuard(String(args.sql || ''));
@@ -336,6 +376,7 @@ async function runAgent(env, msg, text, reply) {
   // guard: history tidak boleh diakhiri 'user' (bikin dua user berurutan → API tolak)
   while (history.length && history[history.length - 1].role === 'user') history.pop();
   const messages = [...history, { role: 'user', content: text }];
+  let stagedDraft = false; // M4: ada draft siap konfirmasi?
 
   try {
     let resp = await callClaude(env, { system, messages, tools: TOOLS });
@@ -351,6 +392,7 @@ async function runAgent(env, msg, text, reply) {
       const toolResults = [];
       for (const block of resp.content) {
         if (block.type !== 'tool_use') continue;
+        if (block.name === 'siapkan_draft') { stagedDraft = true; }
         let out;
         try {
           out = await runTool(env, String(msg.from.id), block.name, block.input || {});
@@ -379,9 +421,9 @@ async function runAgent(env, msg, text, reply) {
       return false;
     }
 
-    console.log(`[agent] tool_calls=${steps} reply="${finalText.slice(0, 120)}"`);
+    console.log(`[agent] tool_calls=${steps} stagedDraft=${stagedDraft} reply="${finalText.slice(0, 120)}"`);
     await saveHistory(env.DB, userId, text, finalText);
-    await reply(msg.chat.id, finalText);
+    await reply(msg.chat.id, finalText, stagedDraft ? 'draft' : null);
     return true;
   } catch (err) {
     // AI gagal/timeout → SILENT fallback ke parser lama (jangan tampilkan error)
