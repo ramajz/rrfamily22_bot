@@ -334,6 +334,19 @@ function daysInMonth() {
   return new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
 }
 
+// Deskripsi error AI untuk user — kategori saja, JANGAN tampilkan error text mentah
+function describeAiError(err) {
+  const msg = String((err && err.message) || err || '');
+  if (msg.includes('400') || /invalid_request/i.test(msg)) return '\u26a0\ufe0f AI nolak permintaan format (400). Coba rephrase.';
+  if (msg.includes('401') || msg.includes('403') || /unauthorized|invalid.*key/i.test(msg)) return '\ud83d\udd10 AI auth bermasalah (401) - cek API key.';
+  if (msg.includes('404') || /model.*not found/i.test(msg)) return '\ud83e\udd16 Model AI tidak ditemukan (404).';
+  if (msg.includes('429') || /rate.?limit/i.test(msg)) return '\u23f3 AI lagi penuh (rate limit). Coba lagi sebentar.';
+  if (msg.includes('500') || msg.includes('502') || msg.includes('503') || msg.includes('529') || /overloaded/i.test(msg)) return '\ud83d\udee0 AI server lagi down. Coba lagi nanti.';
+  if (/abort|timeout|timed out/i.test(msg)) return '\u23f1 AI lambat respon (timeout). Coba lagi.';
+  if (/fetch fail|failed to fetch|network|ECONN/i.test(msg)) return '\ud83d\udce1 Gak bisa nyambung ke AI. Retry.';
+  return '\u26a0\ufe0f Error parsing. Coba lagi atau pakai tombol.';
+}
+
 // ============ AI Functions ============
 // Provider: PRIMARY = Syncera (native Anthropic /v1/messages),
 //           SECONDARY = DataByte (OpenAI-compatible, cadangan kalau Syncera down).
@@ -1915,7 +1928,7 @@ async function handleMessage(env, msg) {
     return sendMessageKb(env, chatId, 'Gak ngerti 😅 Kirim nominal buat catat, atau pakai tombol:', mainMenuKeyboard());
   } catch (err) {
     console.error('AI parse error:', err);
-    return sendMessageKb(env, chatId, '⚠️ Error parsing. Coba lagi atau pakai tombol.', mainMenuKeyboard());
+    return sendMessageKb(env, chatId, describeAiError(err), mainMenuKeyboard());
   }
 }
 
