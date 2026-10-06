@@ -335,39 +335,76 @@ function daysInMonth() {
 }
 
 // ============ AI Functions ============
+// Provider: PRIMARY = Syncera (native Anthropic /v1/messages),
+//           SECONDARY = DataByte (OpenAI-compatible, cadangan kalau Syncera down).
+// CommandCode DIHAPUS — plan Go tidak punya API access (terverifikasi 2026-10-06).
+// model param dari pemanggil dipakai untuk jalur DataByte saja; jalur Syncera
+// memakai AGENT_MODEL (Claude — vision-capable, jadi visionStruk tetap jalan).
 async function callAI(env, { system, user, model, visionBase64 }) {
-  const primary = { endpoint: env.AI_ENDPOINT, key: env.AI_API_KEY, model };
-  const fallback = { endpoint: env.CC_ENDPOINT, key: env.CC_API_KEY, model: model.includes('MiniMax') ? env.CC_VISION_MODEL : env.CC_MODEL };
+  const providers = [
+    { type: 'anthropic', endpoint: env.AGENT_ENDPOINT || 'https://api.syncera.id/anthropic', key: env.AGENT_API_KEY, model: env.AGENT_MODEL || 'claude-sonnet-5' },
+    { type: 'openai', endpoint: env.AI_ENDPOINT, key: env.AI_API_KEY, model },
+  ];
 
-  const content = visionBase64
+  // Konten untuk Anthropic (image block) vs OpenAI (image_url)
+  const anthropicContent = visionBase64
+    ? [{ type: 'text', text: user }, { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: visionBase64 } }]
+    : user;
+  const openaiContent = visionBase64
     ? [{ type: 'text', text: user }, { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${visionBase64}` } }]
     : user;
 
   let lastErr = null;
-  for (const p of [primary, fallback]) {
+  for (const p of providers) {
     if (!p.endpoint || !p.key || !p.model) continue;
     try {
       const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 25000);
-      const res = await fetch(p.endpoint + '/chat/completions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${p.key}` },
-        body: JSON.stringify({
-          model: p.model,
-          messages: [{ role: 'system', content: system }, { role: 'user', content }],
-          temperature: 0,
-          max_tokens: 200,
-        }),
-        signal: ctrl.signal,
-      });
-      clearTimeout(timer);
-      if (!res.ok) {
-        const err = await res.text();
-        lastErr = new Error(`AI error (${p.endpoint}): ${err.slice(0, 150)}`);
-        continue;
+      const timer = setTimeout(() => ctrl.abort(), 30000);
+      let contentOut;
+
+      if (p.type === 'anthropic') {
+        const res = await fetch(p.endpoint + '/v1/messages', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-api-key': p.key, 'anthropic-version': '2023-06-01' },
+          body: JSON.stringify({
+            model: p.model,
+            max_tokens: 300,
+            system,
+            messages: [{ role: 'user', content: anthropicContent }],
+            temperature: 0,
+          }),
+          signal: ctrl.signal,
+        });
+        clearTimeout(timer);
+        if (!res.ok) {
+          const err = await res.text();
+          lastErr = new Error(`AI error (${p.endpoint}): ${res.status} ${err.slice(0, 150)}`);
+          continue;
+        }
+        const data = await res.json();
+        contentOut = (data.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('\n');
+      } else {
+        const res = await fetch(p.endpoint + '/chat/completions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${p.key}` },
+          body: JSON.stringify({
+            model: p.model,
+            messages: [{ role: 'system', content: system }, { role: 'user', content: openaiContent }],
+            temperature: 0,
+            max_tokens: 200,
+          }),
+          signal: ctrl.signal,
+        });
+        clearTimeout(timer);
+        if (!res.ok) {
+          const err = await res.text();
+          lastErr = new Error(`AI error (${p.endpoint}): ${err.slice(0, 150)}`);
+          continue;
+        }
+        const data = await res.json();
+        contentOut = data.choices?.[0]?.message?.content || '{}';
       }
-      const data = await res.json();
-      const contentOut = data.choices?.[0]?.message?.content || '{}';
+
       try {
         const parsed = JSON.parse(contentOut.replace(/```json|```/g, '').trim());
         return { parsed, provider: p.endpoint };
