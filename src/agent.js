@@ -275,6 +275,49 @@ function sqlGuard(raw) {
   return { rejected: false, sql: finalQ };
 }
 
+// ── Chat history (M3) ──────────────────────────────────────────────────
+const HISTORY_MAX = 12;   // pesan terakhir yang dikirim sebagai konteks
+const HISTORY_KEEP = 100; // total baris disimpan per user
+
+async function loadHistory(db, userId) {
+  try {
+    const res = await db
+      .prepare(
+        'SELECT role, content FROM chat_history WHERE user_id = ? ORDER BY id DESC LIMIT ?'
+      )
+      .bind(userId, HISTORY_MAX)
+      .all();
+    // dibalik jadi urut kronologis
+    return (res.results || []).reverse().map((r) => ({ role: r.role, content: r.content }));
+  } catch {
+    return []; // tabel belum ada / error → konteks kosong (gak fatal)
+  }
+}
+
+async function saveHistory(db, userId, userText, assistantText) {
+  try {
+    const now = new Date().toISOString();
+    await db
+      .prepare(
+        'INSERT INTO chat_history (user_id, role, content, created_at) VALUES (?, ?, ?, ?), (?, ?, ?, ?)'
+      )
+      .bind(
+        userId, 'user', String(userText).slice(0, 1000), now,
+        userId, 'assistant', String(assistantText).slice(0, 2000), now
+      )
+      .run();
+    // trim: sisakan HISTORY_KEEP terakhir
+    await db
+      .prepare(
+        'DELETE FROM chat_history WHERE user_id = ? AND id NOT IN (SELECT id FROM chat_history WHERE user_id = ? ORDER BY id DESC LIMIT ?)'
+      )
+      .bind(userId, userId, HISTORY_KEEP)
+      .run();
+  } catch {
+    // history gagal simpan tidak boleh menggagalkan balasan
+  }
+}
+
 // ── Router utama M1 ────────────────────────────────────────────────────
 // reply = fungsi dari index.js untuk kirim pesan + keyboard
 //         (menghindari circular import antara index.js <-> agent.js)
@@ -288,7 +331,11 @@ async function runAgent(env, msg, text, reply) {
   }
 
   const system = AGENT_SYSTEM + '\n\nSkema database (SQLite):\n' + schema;
-  const messages = [{ role: 'user', content: text }];
+  const userId = String(msg.from.id);
+  const history = await loadHistory(env.DB, userId);
+  // guard: history tidak boleh diakhiri 'user' (bikin dua user berurutan → API tolak)
+  while (history.length && history[history.length - 1].role === 'user') history.pop();
+  const messages = [...history, { role: 'user', content: text }];
 
   try {
     let resp = await callClaude(env, { system, messages, tools: TOOLS });
@@ -333,6 +380,7 @@ async function runAgent(env, msg, text, reply) {
     }
 
     console.log(`[agent] tool_calls=${steps} reply="${finalText.slice(0, 120)}"`);
+    await saveHistory(env.DB, userId, text, finalText);
     await reply(msg.chat.id, finalText);
     return true;
   } catch (err) {
