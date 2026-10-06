@@ -10,6 +10,13 @@
 
 const AGENT_MAX_TOOLS = 5; // anti-loop per pesan
 
+// Helper lokal — todayStr di index.js tidak di-export (hindari circular import)
+// Format YYYY-MM-DD zona WIB (UTC+7)
+function todayStr() {
+  const now = new Date(Date.now() + 7 * 3600 * 1000);
+  return now.toISOString().slice(0, 10);
+}
+
 // DDL ringkas untuk system prompt — diambil dari sqlite_master (otomatis ikut skema)
 async function getSchema(db) {
   const res = await db
@@ -252,8 +259,13 @@ async function runAgent(env, msg, text, reply) {
       .map((b) => b.text)
       .join('\n')
       .trim();
-    if (!finalText || finalText.includes('[FALLBACK]')) return false; // niat tulis / kosong → parser lama
+    if (!finalText) return false; // model gak jawab → fallback
+    if (finalText.includes('[FALLBACK]')) {
+      console.log('[agent] niat tulis -> FALLBACK ke parser lama');
+      return false;
+    }
 
+    console.log(`[agent] tool_calls=${steps} reply="${finalText.slice(0, 120)}"`);
     await reply(msg.chat.id, finalText);
     return true;
   } catch (err) {
