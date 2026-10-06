@@ -1,0 +1,266 @@
+// ── RRFamily v3 Agent (M1) ─────────────────────────────────────────────
+// Intent router + read-only tools via Syncera (native Anthropic API).
+// Dipanggil dari handleMessage SETELAH pending/command/state-flow,
+// SEBELUM parser lama (regexParse/aiParse) sebagai fallback.
+//
+// Guardrail PRD v3:
+//  - Hanya tool READ yang ada di M1 (write tetap flow lama + konfirmasi)
+//  - Semua angka dijawab dari hasil query D1, bukan karangan model
+//  - Jangan pernah mencetak API key ke log
+
+const AGENT_MAX_TOOLS = 5; // anti-loop per pesan
+
+// DDL ringkas untuk system prompt — diambil dari sqlite_master (otomatis ikut skema)
+async function getSchema(db) {
+  const res = await db
+    .prepare(
+      "SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+    )
+    .all();
+  return (res.results || [])
+    .map((r) => r.sql)
+    .filter(Boolean)
+    .join('\n\n');
+}
+
+const AGENT_SYSTEM = `Kamu adalah asisten keuangan keluarga RRFamily di Telegram.
+Kamu punya akses tools READ-ONLY ke database pengguna.
+
+Aturan keras:
+1. Angka (rupiah, jumlah, tanggal) HARUS dari hasil tool. Jangan pernah mengarang angka.
+2. Jika tool gagal atau hasil kosong, bilang apa adanya — jangan mengkarang.
+3. Jawab ringkas, bahasa Indonesia santai, format Telegram HTML (<b>, <code>).
+4. Untuk MENULIS data (catat transaksi, edit, hapus, set budget): balas HANYA teks "[FALLBACK]" — sistem yang mengarahkan ke flow catat/tombol konfirmasi. Jangan jelaskan panjang lebar.
+5. Sebut satuan penuh (rupiah), jangan pakai format aneh.`;
+
+// Wrapper Syncera — native Anthropic Messages API
+async function callClaude(env, { system, messages, tools }) {
+  const endpoint = env.AGENT_ENDPOINT || 'https://api.syncera.id/anthropic';
+  const key = env.AGENT_API_KEY;
+  const model = env.AGENT_MODEL || 'claude-sonnet-5';
+  if (!key) throw new Error('AGENT_API_KEY tidak diset');
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 30000);
+  try {
+    const res = await fetch(endpoint + '/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': key,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: 1024,
+        system,
+        messages,
+        ...(tools && tools.length ? { tools } : {}),
+      }),
+      signal: ctrl.signal,
+    });
+    if (!res.ok) {
+      const err = await res.text();
+      throw new Error(`Syncera ${res.status}: ${err.slice(0, 200)}`);
+    }
+    return await res.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ── Tools M1 (READ ONLY) ───────────────────────────────────────────────
+const TOOLS = [
+  {
+    name: 'cek_budget',
+    description:
+      'Cek budget bulan ini: nominal budget, total terpakai, dan sisa. scope: keluarga | pribadi',
+    input_schema: {
+      type: 'object',
+      properties: {
+        scope: { type: 'string', enum: ['keluarga', 'pribadi'] },
+      },
+      required: ['scope'],
+    },
+  },
+  {
+    name: 'riwayat',
+    description:
+      'Daftar transaksi terakhir. scope opsional, days = rentang hari terakhir (default 7), limit maks 20.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        scope: { type: 'string', enum: ['keluarga', 'pribadi'] },
+        days: { type: 'integer', minimum: 1, maximum: 90 },
+        limit: { type: 'integer', minimum: 1, maximum: 20 },
+      },
+    },
+  },
+  {
+    name: 'cari_transaksi',
+    description: 'Cari transaksi berdasarkan kata kunci (note, item, atau kategori).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string' },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'harga_item',
+    description:
+      'Riwayat harga suatu item/kata kunci: min, max, 5 entri terakhir, dan tren (naik/turun/stabil).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        keyword: { type: 'string' },
+      },
+      required: ['keyword'],
+    },
+  },
+];
+
+// Eksekusi tool → hasil JSON string (yang dikirim balik ke model sebagai tool_result)
+async function runTool(env, userId, name, args) {
+  const db = env.DB;
+  const ymd = (d) => d.toISOString().slice(0, 10); // fallback simple
+
+  if (name === 'cek_budget') {
+    const scope = args.scope;
+    const budget = await db
+      .prepare('SELECT amount FROM budgets WHERE scope = ?')
+      .bind(scope)
+      .first();
+    const row = await db
+      .prepare(
+        "SELECT COALESCE(SUM(amount),0) AS used FROM transactions WHERE user_id = ? AND scope = ? AND type = 'expense' AND substr(tx_date,1,7) = substr(?,1,7)"
+      )
+      .bind(userId, scope, todayStr())
+      .first();
+    return JSON.stringify({
+      scope,
+      budget: budget ? budget.amount : null,
+      used: row?.used || 0,
+      remaining: budget ? budget.amount - (row?.used || 0) : null,
+      periode: todayStr().slice(0, 7),
+    });
+  }
+
+  if (name === 'riwayat') {
+    const days = Math.min(Math.max(args.days || 7, 1), 90);
+    const limit = Math.min(Math.max(args.limit || 10, 1), 20);
+    const sql = args.scope
+      ? 'SELECT id, type, category, note, item, amount, tx_date, scope FROM transactions WHERE user_id = ? AND scope = ? AND tx_date >= date(?, ?) ORDER BY id DESC LIMIT ?'
+      : 'SELECT id, type, category, note, item, amount, tx_date, scope FROM transactions WHERE user_id = ? AND tx_date >= date(?, ?) ORDER BY id DESC LIMIT ?';
+    const binds = args.scope
+      ? [userId, args.scope, todayStr(), `-${days} days`, limit]
+      : [userId, todayStr(), `-${days} days`, limit];
+    const res = await db.prepare(sql).bind(...binds).all();
+    return JSON.stringify({ days, rows: res.results || [] });
+  }
+
+  if (name === 'cari_transaksi') {
+    const q = String(args.query || '').trim().slice(0, 60);
+    if (!q) return JSON.stringify({ rows: [], note: 'query kosong' });
+    const res = await db
+      .prepare(
+        'SELECT id, type, category, note, item, amount, tx_date, scope FROM transactions WHERE user_id = ? AND (LOWER(COALESCE(note,"")) LIKE ? OR LOWER(COALESCE(item,"")) LIKE ? OR LOWER(category) LIKE ?) ORDER BY id DESC LIMIT 15'
+      )
+      .bind(userId, `%${q.toLowerCase()}%`, `%${q.toLowerCase()}%`, `%${q.toLowerCase()}%`)
+      .all();
+    return JSON.stringify({ query: q, rows: res.results || [] });
+  }
+
+  if (name === 'harga_item') {
+    const kw = String(args.keyword || '').trim().toLowerCase().slice(0, 60);
+    if (!kw) return JSON.stringify({ note: 'keyword kosong' });
+    const res = await db
+      .prepare(
+        'SELECT amount, tx_date FROM transactions WHERE user_id = ? AND type = ? AND (LOWER(COALESCE(item,"")) LIKE ? OR LOWER(COALESCE(note,"")) LIKE ?) ORDER BY id DESC LIMIT 50'
+      )
+      .bind(userId, 'expense', `%${kw}%`, `%${kw}%`)
+      .all();
+    const rows = res.results || [];
+    if (!rows.length) return JSON.stringify({ keyword: kw, rows: [] });
+    const amounts = rows.map((r) => r.amount);
+    const min = Math.min(...amounts);
+    const max = Math.max(...amounts);
+    const last5 = rows.slice(0, 5);
+    // tren dari 5 terakhir (terbaru dulu): bandingkan paruh awal vs akhir
+    let trend = 'stabil';
+    if (last5.length >= 4) {
+      const newer = (last5[0].amount + (last5[1]?.amount || 0)) / (last5[1] ? 2 : 1);
+      const older = (last5[last5.length - 1].amount + last5[last5.length - 2].amount) / 2;
+      if (newer > older * 1.1) trend = 'naik';
+      else if (newer < older * 0.9) trend = 'turun';
+    }
+    return JSON.stringify({ keyword: kw, count: rows.length, min, max, trend, last5 });
+  }
+
+  return JSON.stringify({ error: `tool tidak dikenal: ${name}` });
+}
+
+// ── Router utama M1 ────────────────────────────────────────────────────
+// reply = fungsi dari index.js untuk kirim pesan + keyboard
+//         (menghindari circular import antara index.js <-> agent.js)
+// Return: true = pesan sudah ditangani agent, false = lanjut ke parser lama.
+async function runAgent(env, msg, text, reply) {
+  let schema;
+  try {
+    schema = await getSchema(env.DB);
+  } catch {
+    return false; // fallback parser lama
+  }
+
+  const system = AGENT_SYSTEM + '\n\nSkema database (SQLite):\n' + schema;
+  const messages = [{ role: 'user', content: text }];
+
+  try {
+    let resp = await callClaude(env, { system, messages, tools: TOOLS });
+    let steps = 0;
+
+    // Loop tool-call sampai jawaban final (guard: max AGENT_MAX_TOOLS)
+    while (
+      steps < AGENT_MAX_TOOLS &&
+      resp.content &&
+      resp.content.some((b) => b.type === 'tool_use')
+    ) {
+      steps++;
+      const toolResults = [];
+      for (const block of resp.content) {
+        if (block.type !== 'tool_use') continue;
+        let out;
+        try {
+          out = await runTool(env, String(msg.from.id), block.name, block.input || {});
+        } catch (e) {
+          out = JSON.stringify({ error: String(e && e.message ? e.message : e).slice(0, 300) });
+        }
+        toolResults.push({
+          type: 'tool_result',
+          tool_use_id: block.id,
+          content: out,
+        });
+      }
+      messages.push({ role: 'assistant', content: resp.content });
+      messages.push({ role: 'user', content: toolResults });
+      resp = await callClaude(env, { system, messages, tools: TOOLS });
+    }
+
+    const finalText = (resp.content || [])
+      .filter((b) => b.type === 'text')
+      .map((b) => b.text)
+      .join('\n')
+      .trim();
+    if (!finalText || finalText.includes('[FALLBACK]')) return false; // niat tulis / kosong → parser lama
+
+    await reply(msg.chat.id, finalText);
+    return true;
+  } catch (err) {
+    // AI gagal/timeout → SILENT fallback ke parser lama (jangan tampilkan error)
+    console.error('agent error:', err && err.message ? err.message : err);
+    return false;
+  }
+}
+
+export { runAgent };

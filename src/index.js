@@ -1,3 +1,4 @@
+import { runAgent } from './agent.js';
 import { Hono } from 'hono';
 
 const app = new Hono();
@@ -1760,6 +1761,14 @@ async function handleMessage(env, msg) {
       summary += `\nPilih aksi:`;
       return sendMessageKb(env, chatId, summary, draftKeyboard(draft.scope));
     }
+
+    // STEP 1.5: v3 agent (M1) — pertanyaan baca via Syncera (read-only tools).
+    // Agent hanya menangani PERTANYAAN. Jika butuh menulis data, model membalas
+    // [FALLBACK] dan kita lanjut ke STEP 2 (parser lama) — flow tulis TIDAK berubah.
+    const agentOk = await runAgent(env, msg, text, (cid, ft) =>
+      sendMessageKb(env, cid, ft, mainMenuKeyboard())
+    );
+    if (agentOk) return;
 
     // STEP 2: AI fallback (only for complex input)
     const parsed = await aiParse(env, text, defaultScope);
