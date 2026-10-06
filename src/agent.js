@@ -132,10 +132,11 @@ const TOOLS = [
   {
     name: 'siapkan_draft',
     description:
-      'Untuk MENYIMPAN transaksi (catat): siapkan satu draft transaksi. ' +
-      'Sistem akan menampilkan ringkasan + tombol konfirmasi ke user. ' +
-      'Panggil SATU draft per pesan. Jika pesan berisi lebih dari satu transaksi, ' +
-      'siapkan yang pertama saja dan sebutkan sisanya di jawaban teks (user mengirim lagi setelah konfirmasi).',
+      'Untuk MENYIMPAN transaksi (catat): siapkan draft untuk transaksi PERTAMA saja (maksimal 1 per pesan). ' +
+      'Sistem menampilkan draft itu untuk konfirmasi tombol. ' +
+      'Jika pesan berisi lebih dari satu transaksi (mis. "pagi kopi 5k dan siang es teh 10k"), ' +
+      'buat HANYA draft yang pertama, lalu di jawaban teks sebutkan transaksi LAINNYA yang belum disimpan ' +
+      'dan sarankan user mengirimnya satu per satu setelah konfirmasi.',
     input_schema: {
       type: 'object',
       properties: {
@@ -167,7 +168,7 @@ const TOOLS = [
 ];
 
 // Eksekusi tool → hasil JSON string (yang dikirim balik ke model sebagai tool_result)
-async function runTool(env, userId, name, args) {
+async function runTool(env, userId, name, args, ctx = {}) {
   const db = env.DB;
   const ymd = (d) => d.toISOString().slice(0, 10); // fallback simple
 
@@ -245,6 +246,11 @@ async function runTool(env, userId, name, args) {
 
 
   if (name === 'siapkan_draft') {
+    if (ctx.stagedDraft) {
+      // guard KODE: tabel pending_input PK=telegram_id (1 slot) — draft ke-2 menimpa
+      return JSON.stringify({ error: 'draft sudah ada, hanya 1 per pesan — sebutkan transaksi lain di jawaban teks' });
+    }
+    ctx.stagedDraft = true;
     // tulis ke pending_input sebagai draft (action catat_draft) — sama dengan saveDraft()
     // transaksi BELUM masuk transactions; butuh konfirmasi tombol draft_save
     const type = args.type === 'income' ? 'income' : 'expense';
@@ -376,7 +382,7 @@ async function runAgent(env, msg, text, reply) {
   // guard: history tidak boleh diakhiri 'user' (bikin dua user berurutan → API tolak)
   while (history.length && history[history.length - 1].role === 'user') history.pop();
   const messages = [...history, { role: 'user', content: text }];
-  let stagedDraft = false; // M4: ada draft siap konfirmasi?
+  const ctx = { stagedDraft: false }; // M4: persisten antar tool_use call
 
   try {
     let resp = await callClaude(env, { system, messages, tools: TOOLS });
@@ -392,10 +398,10 @@ async function runAgent(env, msg, text, reply) {
       const toolResults = [];
       for (const block of resp.content) {
         if (block.type !== 'tool_use') continue;
-        if (block.name === 'siapkan_draft') { stagedDraft = true; }
+        // stagedDraft dibaca dari ctx via runTool
         let out;
         try {
-          out = await runTool(env, String(msg.from.id), block.name, block.input || {});
+          out = await runTool(env, String(msg.from.id), block.name, block.input || {}, ctx);
         } catch (e) {
           out = JSON.stringify({ error: String(e && e.message ? e.message : e).slice(0, 300) });
         }
@@ -421,9 +427,9 @@ async function runAgent(env, msg, text, reply) {
       return false;
     }
 
-    console.log(`[agent] tool_calls=${steps} stagedDraft=${stagedDraft} reply="${finalText.slice(0, 120)}"`);
+    console.log(`[agent] tool_calls=${steps} stagedDraft=${ctx.stagedDraft} reply="${finalText.slice(0, 120)}"`);
     await saveHistory(env.DB, userId, text, finalText);
-    await reply(msg.chat.id, finalText, stagedDraft ? 'draft' : null);
+    await reply(msg.chat.id, finalText, ctx.stagedDraft ? 'draft' : null);
     return true;
   } catch (err) {
     // AI gagal/timeout → SILENT fallback ke parser lama (jangan tampilkan error)

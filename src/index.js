@@ -193,6 +193,20 @@ async function deleteDraft(env, userId) {
     .bind(userId, 'catat_draft').run();
 }
 
+
+// M4 guard: pesan yang terlalu kompleks untuk regex 1-transaksi
+// (multi-amount, konjungsi, kata waktu bebas) -> langsung ke agent
+function looksComplex(text) {
+  const t = text.toLowerCase();
+  // jumlah pola angka yang cocok (5k, 10rb, 10.000, 1jt, rp...)
+  const amountRe = /(?:rp\.?\s*\d|\d+(?:[.,]\d+)?\s*(?:rb|ribu|k\b|jt|j\b|juta)|(?:\d{1,3}[.,])+\d{3}|\d{4,})/g;
+  const hits = (t.match(amountRe) || []).length;
+  if (hits >= 2) return true;
+  // konjungsi penghubung dua kejadian
+  if (/\b(dan|terus|trus|sambil|setelah|abis|habis itu|kemudian|lalu)\b/.test(t) && hits >= 1) return true;
+  return false;
+}
+
 function regexParse(text) {
   // Try to parse: "[item] [amount]"
   // Examples: "mie apong 50rb", "bensin 75rb", "listrik 350.000"
@@ -1784,8 +1798,9 @@ async function handleMessage(env, msg) {
     const userRow = await env.DB.prepare('SELECT scope FROM users WHERE telegram_id = ?').bind(userId).first();
     const defaultScope = userRow?.scope || 'keluarga';
 
-    // STEP 1: Try regex parse (no AI cost)
-    const regexResult = regexParse(text);
+    // STEP 1: Try regex parse (no AI cost) — kecuali pesan kompleks
+    const complex = looksComplex(text);
+    const regexResult = complex ? null : regexParse(text);
 
     if (regexResult && regexResult.amount && !/kategori|catatan/i.test(text)) {
       // Save draft to D1 and show summary
