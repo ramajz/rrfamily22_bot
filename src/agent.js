@@ -40,6 +40,9 @@ Aturan keras:
 4. Untuk CATAT transaksi: pakai tool siapkan_draft (SISTEM yang menampilkan konfirmasi tombol). Sebut di jawaban teks kalau ada transaksi lain di pesan yang sama (staged draft hanya untuk yang pertama). Untuk edit/hapus/set budget pakai [FALLBACK].
 5. Sebut satuan penuh (rupiah), jangan pakai format aneh.
 6. Untuk pertanyaan analitis/apapun yang butuh query data bebas, pakai tool tanya_data.
+6b. SAAT user menyebut rentang waktu (hari ini/kemarin/bulan ini/minggu ini), WAJIB filter waktu
+    di tool (riwayat.tanggal / riwayat.tanggal_akhir / tanya_data dengan WHERE tanggal sesuai).
+    JANGAN pernah menampilkan transaksi di luar rentang yang diminta — meski jumlahnya kecil.
    Tulis SATU query SELECT/WITH SQLite yang valid. Jika query ditolak atau error,
    boleh revisi MAKSIMAL 1x; kalau gagal lagi, jawab jujur "data tidak ditemukan".`;
 
@@ -96,11 +99,16 @@ const TOOLS = [
   {
     name: 'riwayat',
     description:
-      'Daftar transaksi terakhir. scope opsional, days = rentang hari terakhir (default 7), limit maks 20.',
+      'Daftar transaksi. Jika user menyebut rentang spesifik (hari ini/kemarin/bulan ini), ' +
+      'WAJIB isi tanggal/tanggal_akhir agar hasil TIDAK melebar. ' +
+      'tanggal = YYYY-MM-DD eksak (hari itu saja), tanggal_akhir = rentang sampai tanggal itu, ' +
+      'days = rentang hari terakhir (default 7), scope opsional, limit maks 20.',
     input_schema: {
       type: 'object',
       properties: {
         scope: { type: 'string', enum: ['keluarga', 'pribadi'] },
+        tanggal: { type: 'string', description: 'YYYY-MM-DD — hanya transaksi tanggal ini' },
+        tanggal_akhir: { type: 'string', description: 'YYYY-MM-DD — sampai tanggal ini (dari hari ini)' },
         days: { type: 'integer', minimum: 1, maximum: 90 },
         limit: { type: 'integer', minimum: 1, maximum: 20 },
       },
@@ -194,16 +202,39 @@ async function runTool(env, userId, name, args, ctx = {}) {
   }
 
   if (name === 'riwayat') {
-    const days = Math.min(Math.max(args.days || 7, 1), 90);
     const limit = Math.min(Math.max(args.limit || 10, 1), 20);
-    const sql = args.scope
-      ? 'SELECT id, type, category, note, item, amount, tx_date, scope FROM transactions WHERE user_id = ? AND scope = ? AND tx_date >= date(?, ?) ORDER BY id DESC LIMIT ?'
-      : 'SELECT id, type, category, note, item, amount, tx_date, scope FROM transactions WHERE user_id = ? AND tx_date >= date(?, ?) ORDER BY id DESC LIMIT ?';
-    const binds = args.scope
-      ? [userId, args.scope, todayStr(), `-${days} days`, limit]
-      : [userId, todayStr(), `-${days} days`, limit];
+    const sel = 'SELECT id, type, category, note, item, amount, tx_date, scope FROM transactions WHERE user_id = ?';
+    const where = [];
+    const binds = [userId];
+
+    if (args.scope) { where.push('scope = ?'); binds.push(args.scope); }
+
+    const dateRe = /^\d{4}-\d{2}-\d{2}$/;
+    if (args.tanggal && dateRe.test(args.tanggal)) {
+      // hari eksak saja
+      where.push('tx_date = ?');
+      binds.push(args.tanggal);
+    } else if (args.tanggal_akhir && dateRe.test(args.tanggal_akhir)) {
+      where.push('tx_date >= ? AND tx_date <= ?');
+      binds.push(todayStr(), args.tanggal_akhir);
+    } else {
+      const days = Math.min(Math.max(args.days || 7, 1), 90);
+      where.push('tx_date >= date(?, ?)');
+      binds.push(todayStr(), `-${days} days`);
+    }
+
+    where.push('1=1');
+    const sql = `${sel} AND ${where.join(' AND ')} ORDER BY id DESC LIMIT ?`;
+    binds.push(limit);
     const res = await db.prepare(sql).bind(...binds).all();
-    return JSON.stringify({ days, rows: res.results || [] });
+    const rows = res.results || [];
+    const totalExpense = rows.filter((r) => r.type === 'expense').reduce((a, r) => a + (r.amount || 0), 0);
+    return JSON.stringify({
+      periode: args.tanggal || (args.tanggal_akhir ? `sampai ${args.tanggal_akhir}` : `-${(args.days || 7)} hari`),
+      count: rows.length,
+      total_expense: totalExpense,
+      rows,
+    });
   }
 
   if (name === 'cari_transaksi') {
