@@ -340,8 +340,22 @@ async function loadHistory(db, userId) {
   }
 }
 
+// Opsi 1 (2026-10-06): buang basa-basi dari history — simpan hanya pesan yang
+// membawa data/konteks. Jaring: pesan pendek tanpa angka & tanpa tanda tanya
+// yang cocok denylist (oke/siap/thanks/tes/dll) = noise.
+const NOISE_RE = /^(oke+|ok+|siap+|sip+|ya+|yaudah+|iy+a+|noh?|thanks?|thx|tq|makasih?|mantap+|bagus+|halo+h?|hai+|hi+|hello+|tes+|test+|pagi|siang|sore|malam|bye+|dadah|assalamualaikum)[\s!.~]*$/i;
+
+function isNoiseHistory(text) {
+  const t = String(text || '').trim();
+  if (!t) return true;
+  if (t.length > 40) return false;          // pesan panjang = kemungkinan penting
+  if (/\d|[?]/.test(t)) return false;       // ada angka / tanda tanya = jangan dibuang
+  return NOISE_RE.test(t);
+}
+
 async function saveHistory(db, userId, userText, assistantText) {
   try {
+    if (isNoiseHistory(userText)) return; // basa-basi → jangan masuk history
     const now = new Date().toISOString();
     await db
       .prepare(
