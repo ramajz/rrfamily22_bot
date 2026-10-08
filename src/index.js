@@ -293,6 +293,40 @@ async function regexCategoryPicker(db, scope, typeFilter = null) {
   return kb;
 }
 
+// Kata kunci -> kategori (jalur regex, cepat tanpa AI).
+// Hanya untuk kategori yang TERSEDIA di scope user; kata bersinggungan
+// (makan/jajan) sengaja tidak dimasukkan - tombol kategori tetap jalan.
+const CATEGORY_KEYWORDS = {
+  Kesehatan: ['dokter', 'periksa', 'obat', 'klinik', 'rumah sakit', 'vaksin', 'gigi', 'apotek'],
+  Transport: ['bensin', 'parkir', 'ojek', 'grab', 'tol', 'angkot', 'busway', 'servis motor', 'servis mobil'],
+  Kebutuhan: ['sembako', 'listrik', 'pln', 'pulsa', 'internet', 'gas ', 'air ', 'sabun', 'shampoo'],
+  Pendidikan: ['spp', 'sekolah', 'kursus', 'les ', 'buku sekolah'],
+  Cicilan: ['cicilan', 'angsuran', 'kpr', 'kredit'],
+  Hiburan: ['bioskop', 'nonton', 'konser', 'tiket ', 'liburan'],
+};
+
+async function keywordCategoryFromText(db, text, scope) {
+  const lower = String(text || '').toLowerCase();
+  const cats = await getCategories(db, scope);
+  for (const [cat, words] of Object.entries(CATEGORY_KEYWORDS)) {
+    if (!cats.includes(cat)) continue;
+    if (words.some(w => lower.includes(w))) return cat;
+  }
+  return null;
+}
+
+// Ambil frasa tanggal di teks ("kemarin", "3 hari lalu", "tanggal 5/10").
+// Return { date, phrase } atau null. phrase dipakai buat dibersihkan dari catatan.
+function extractDateFromText(text) {
+  const t = String(text || '').toLowerCase();
+  if (/\bkemarin\b/.test(t)) return { date: parseDate('kemarin'), phrase: 'kemarin' };
+  let m = t.match(/(\d+)\s*hari\s*(?:yang\s*)?lalu/);
+  if (m) return { date: parseDate(m[1] + ' hari lalu'), phrase: m[0] };
+  m = t.match(/tanggal\s+(\d{1,2}\/\d{1,2}|\d{4}-\d{2}-\d{2})/);
+  if (m) return { date: parseDate(m[1]), phrase: m[0] };
+  return null;
+}
+
 function parseDate(str) {
   if (!str) return todayStr();
   const s = String(str).trim().toLowerCase();
@@ -1804,13 +1838,17 @@ async function handleMessage(env, msg) {
 
     if (regexResult && regexResult.amount && !/kategori|catatan/i.test(text)) {
       // Save draft to D1 and show summary
-      const regexCategory = await explicitCategoryFromText(env.DB, text, defaultScope);
+      const regexCategory = (await explicitCategoryFromText(env.DB, text, defaultScope))
+        || (await keywordCategoryFromText(env.DB, text, defaultScope));
+      const dateHit = extractDateFromText(text);
+      let note = regexResult.note || '';
+      if (dateHit) note = note.replace(new RegExp(dateHit.phrase, 'i'), '').replace(/\s+/g, ' ').trim();
       const draft = {
-        note: regexResult.note,
+        note: note,
         amount: regexResult.amount,
         scope: defaultScope,
         category: regexCategory || 'Lainnya',
-        date: todayStr(),
+        date: dateHit ? dateHit.date : todayStr(),
         type: regexResult.type || 'expense',
       };
       await saveDraft(env, userId, draft);
